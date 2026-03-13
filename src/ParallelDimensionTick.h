@@ -20,9 +20,11 @@
 namespace dim_parallel {
 
 struct Config {
-    int  version = 1;
-    bool enabled = true;
-    bool debug   = false;
+    int  version            = 1;
+    bool enabled            = true;
+    bool debug              = false;
+    bool parallelActorTick  = true;  // 并行 Actor::tick
+    bool parallelChunkTick  = true;  // 并行 LevelChunk tick
 };
 
 Config&         getConfig();
@@ -57,7 +59,6 @@ class WorkerPool {
 public:
     void start(int numWorkers);
     void stop();
-    // tasks 的生命周期必须在调用期间有效，调用返回时所有任务已执行完毕
     void executeAll(std::vector<std::function<void()>>& tasks);
     int  workerCount() const { return static_cast<int>(mWorkers.size()); }
 
@@ -74,7 +75,6 @@ private:
     std::vector<std::thread> mWorkers;
     std::mutex               mMutex;
     std::condition_variable  mWakeCV;
-    std::condition_variable  mDoneCV;
     Batch                    mBatch;
     uint64_t                 mGeneration = 0;
     bool                     mShutdown   = false;
@@ -93,11 +93,15 @@ public:
     static DimensionType           getCurrentDimensionType();
     static void                    runOnMainThread(std::function<void()> task);
 
+    WorkerPool& getWorkerPool() { return mPool; }
+
     struct Stats {
         std::atomic<uint64_t> totalParallelTicks{0};
         std::atomic<uint64_t> totalFallbackTicks{0};
         std::atomic<uint64_t> totalMainThreadTasks{0};
         std::atomic<uint64_t> maxDimTickTimeUs{0};
+        std::atomic<uint64_t> actorTicksSuppressed{0};
+        std::atomic<uint64_t> actorTicksParallel{0};
     };
     Stats const& getStats() const { return mStats; }
 
