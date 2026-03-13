@@ -78,11 +78,15 @@ void WorkerPool::start(int numWorkers) {
     if (!mWorkers.empty()) return;
     mShutdown   = false;
     mGeneration = 0;
-    mBatch      = {};
+    mBatch.tasks = nullptr;
+    mBatch.count = 0;
+    mBatch.nextIdx.store(0, std::memory_order_relaxed);
+    mBatch.doneCount.store(0, std::memory_order_relaxed);
     for (int i = 0; i < numWorkers; i++) {
         mWorkers.emplace_back([this, i]() { workerLoop(i); });
     }
 }
+
 
 void WorkerPool::stop() {
     {
