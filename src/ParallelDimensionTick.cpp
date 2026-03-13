@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <algorithm>
 #include <unordered_set>
+#include <cstring>
 
 namespace dim_parallel {
 
@@ -26,7 +27,7 @@ static bool hookInstalled = false;
 static thread_local DimensionWorkerContext* tl_currentContext = nullptr;
 static thread_local bool tl_isWorkerThread = false;
 static thread_local int tl_currentDimTypeId = -1;
-static thread_local std::string tl_currentPhase = "idle";
+static thread_local char tl_currentPhase[64] = "idle";
 
 static std::atomic<bool> g_inParallelPhase{false};
 static std::atomic<bool> g_suppressDimensionTick{false};
@@ -149,57 +150,59 @@ void ParallelDimensionTickManager::workerLoop(DimensionWorkerContext* ctx) {
     tl_isWorkerThread = false;
     tl_currentContext = nullptr;
     tl_currentDimTypeId = -1;
-    tl_currentPhase = "idle";
+    strncpy_s(tl_currentPhase, "idle", _TRUNCATE);
 }
 
-// SEH 保护的核心 tick 函数
-static TickResult tickDimensionCoreSafe(Dimension* dim, const std::string& initialPhase) {
-    TickResult result{0, true, initialPhase};
-    
+// SEH 保护的核心 tick 函数 - 纯 C 风格，无 C++ 对象
+static DWORD __stdcall tickDimensionCoreSafe(void* param) {
+    Dimension* dim = static_cast<Dimension*>(param);
     __try {
         if (dim) {
             dim->tick();
         }
+        return 0;
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
-        result.exceptionCode = GetExceptionCode();
-        result.success = false;
-        // 在任何潜在损坏之前捕获阶段信息
-        result.phase = tl_currentPhase;
+        return GetExceptionCode();
     }
-    
-    return result;
 }
 
 void ParallelDimensionTickManager::tickDimensionOnWorker(DimensionWorkerContext& ctx) {
-    tl_currentPhase = "pre-tick";
+    strncpy_s(tl_currentPhase, "pre-tick", _TRUNCATE);
     auto start = std::chrono::steady_clock::now();
 
-    tl_currentPhase = "tick";
-    TickResult result = tickDimensionCoreSafe(ctx.dimensionPtr, "tick");
+    strncpy_s(tl_currentPhase, "tick", _TRUNCATE);
     
-    if (!result.success) {
+    // 保存当前阶段
+    char savedPhase[64];
+    strncpy_s(savedPhase, tl_currentPhase, _TRUNCATE);
+    
+    // 调用 SEH 保护的函数
+    DWORD exceptionCode = tickDimensionCoreSafe(ctx.dimensionPtr);
+    
+    if (exceptionCode != 0) {
         mStats.totalSEHCaught.fetch_add(1, std::memory_order_relaxed);
         
+        std::string phaseStr(tl_currentPhase);
         logger().error("SEH 异常 (代码: 0x{:X}) 发生在维度 {} 的 [{}] 阶段",
-            result.exceptionCode, tl_currentDimTypeId, result.phase);
+            exceptionCode, tl_currentDimTypeId, phaseStr);
         
         // 只标记特定阶段为危险，不标记通用阶段
-        if (result.phase != "pre-tick" && 
-            result.phase != "post-tick" && 
-            result.phase != "idle" && 
-            result.phase != "tick") {
-            markFunctionDangerous(result.phase);
+        if (phaseStr != "pre-tick" && 
+            phaseStr != "post-tick" && 
+            phaseStr != "idle" && 
+            phaseStr != "tick") {
+            markFunctionDangerous(phaseStr);
         }
         
         ctx.tickFaulted.store(true, std::memory_order_release);
         mFallbackToSerial.store(true, std::memory_order_relaxed);
         
-        tl_currentPhase = "idle";
+        strncpy_s(tl_currentPhase, "idle", _TRUNCATE);
         return;
     }
 
-    tl_currentPhase = "post-tick";
+    strncpy_s(tl_currentPhase, "post-tick", _TRUNCATE);
     auto end = std::chrono::steady_clock::now();
     ctx.lastTickTimeUs = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
 
@@ -209,7 +212,7 @@ void ParallelDimensionTickManager::tickDimensionOnWorker(DimensionWorkerContext&
             std::memory_order_relaxed, std::memory_order_relaxed)) break;
     }
 
-    tl_currentPhase = "idle";
+    strncpy_s(tl_currentPhase, "idle", _TRUNCATE);
 }
 
 void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
@@ -516,7 +519,7 @@ LL_TYPE_INSTANCE_HOOK(
     void
 ) {
     const char* funcName = "tickRedstone";
-    tl_currentPhase = funcName;
+    strncpy_s(tl_currentPhase, funcName, _TRUNCATE);
     handleDangerousFunction(funcName, [this]() { origin(); });
 }
 
@@ -528,7 +531,7 @@ LL_TYPE_INSTANCE_HOOK(
     void
 ) {
     const char* funcName = "_sendBlocksChangedPackets";
-    tl_currentPhase = funcName;
+    strncpy_s(tl_currentPhase, funcName, _TRUNCATE);
     handleDangerousFunction(funcName, [this]() { origin(); });
 }
 
@@ -540,7 +543,7 @@ LL_TYPE_INSTANCE_HOOK(
     void
 ) {
     const char* funcName = "_processEntityChunkTransfers";
-    tl_currentPhase = funcName;
+    strncpy_s(tl_currentPhase, funcName, _TRUNCATE);
     handleDangerousFunction(funcName, [this]() { origin(); });
 }
 
@@ -552,7 +555,7 @@ LL_TYPE_INSTANCE_HOOK(
     void
 ) {
     const char* funcName = "_tickEntityChunkMoves";
-    tl_currentPhase = funcName;
+    strncpy_s(tl_currentPhase, funcName, _TRUNCATE);
     handleDangerousFunction(funcName, [this]() { origin(); });
 }
 
@@ -564,7 +567,7 @@ LL_TYPE_INSTANCE_HOOK(
     void
 ) {
     const char* funcName = "_runChunkGenerationWatchdog";
-    tl_currentPhase = funcName;
+    strncpy_s(tl_currentPhase, funcName, _TRUNCATE);
     handleDangerousFunction(funcName, [this]() { origin(); });
 }
 
@@ -578,7 +581,7 @@ LL_TYPE_INSTANCE_HOOK(
     Player* except
 ) {
     const char* funcName = "sendBroadcast";
-    tl_currentPhase = funcName;
+    strncpy_s(tl_currentPhase, funcName, _TRUNCATE);
     handleDangerousFunction(funcName, [this, &packet, except]() {
         origin(packet, except);
     });
@@ -595,7 +598,7 @@ LL_TYPE_INSTANCE_HOOK(
     Player const* except
 ) {
     const char* funcName = "sendPacketForPosition";
-    tl_currentPhase = funcName;
+    strncpy_s(tl_currentPhase, funcName, _TRUNCATE);
     handleDangerousFunction(funcName, [this, &position, &packet, except]() {
         origin(position, packet, except);
     });
@@ -612,7 +615,7 @@ LL_TYPE_INSTANCE_HOOK(
     Player const* except
 ) {
     const char* funcName = "sendPacketForEntity";
-    tl_currentPhase = funcName;
+    strncpy_s(tl_currentPhase, funcName, _TRUNCATE);
     handleDangerousFunction(funcName, [this, &actor, &packet, except]() {
         origin(actor, packet, except);
     });
@@ -678,4 +681,3 @@ bool PluginImpl::disable() {
 } // namespace dim_parallel
 
 LL_REGISTER_MOD(dim_parallel::PluginImpl, dim_parallel::PluginImpl::getInstance());
-
