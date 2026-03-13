@@ -57,23 +57,27 @@ class WorkerPool {
 public:
     void start(int numWorkers);
     void stop();
-    void submitAndWait(std::vector<std::function<void()>>& tasks);
+    // tasks 的生命周期必须在调用期间有效，调用返回时所有任务已执行完毕
+    void executeAll(std::vector<std::function<void()>>& tasks);
     int  workerCount() const { return static_cast<int>(mWorkers.size()); }
 
 private:
-    void workerLoop();
+    void workerLoop(int workerId);
+
+    struct Batch {
+        std::function<void()>* tasks    = nullptr;
+        int                    count    = 0;
+        std::atomic<int>       nextIdx{0};
+        std::atomic<int>       doneCount{0};
+    };
 
     std::vector<std::thread> mWorkers;
     std::mutex               mMutex;
-    std::condition_variable  mStartCV;
+    std::condition_variable  mWakeCV;
     std::condition_variable  mDoneCV;
-
-    std::vector<std::function<void()>> mTasks;
-    std::atomic<int>                   mTaskIndex{0};
-    std::atomic<int>                   mTasksRemaining{0};
-    uint64_t                           mGeneration = 0;
-    uint64_t                           mWorkerGen  = 0;
-    bool                               mShutdown   = false;
+    Batch                    mBatch;
+    uint64_t                 mGeneration = 0;
+    bool                     mShutdown   = false;
 };
 
 class ParallelDimensionTickManager {
