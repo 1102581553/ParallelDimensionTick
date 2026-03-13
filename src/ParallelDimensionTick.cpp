@@ -34,6 +34,9 @@ static std::atomic<bool> g_suppressDimensionTick{false};
 static std::vector<Dimension*> g_collectedDimensions;
 static std::mutex g_dimensionCollectionMutex;
 
+// === 新增：将 tl_workerMainFiber 定义移到此处（在 dimFiberProc 之前） ===
+thread_local void* tl_workerMainFiber = nullptr;
+
 std::unordered_set<std::string> ParallelDimensionTickManager::m_dangerousFunctions;
 std::mutex ParallelDimensionTickManager::m_dangerousMutex;
 
@@ -168,26 +171,7 @@ void CALLBACK ParallelDimensionTickManager::dimFiberProc(LPVOID param) {
 
         ctx->tickDone = true;
 
-        // 切回工作线程的主 fiber
-        // 工作线程在 ConvertThreadToFiber 后得到的 fiber
-        void* workerFiber = GetCurrentFiber();
-        // 不能切回自己，需要一个外部存储的 caller fiber
-        // 我们用 tl_currentContext 中不存在的字段...
-        // 实际上 fiber 切换需要知道切回哪里
-        // 解决方案：在 ctx 中存储 workerMainFiber
-        // 但这里 dimFiberProc 是 fiber 入口，第一次进来时还没有设置
-        // 所以我们需要在 workerThreadProc 中设置后再切换
-
-        // 这里直接用 SwitchToFiber 切回，workerMainFiber 在 ctx 中
-        // 需要在 header 中添加字段... 但为了不改 header，用 thread_local
-        // 不行，fiber 不等于 thread_local
-        // 最简单：在 DimensionFiberContext 中加一个 callerFiber 字段
-        // header 中已经没有了，需要加回来
-
-        // 暂时用一个全局 thread_local
-        // fiber 运行在哪个线程上，thread_local 就是那个线程的
-        // 这是安全的
-        extern thread_local void* tl_workerMainFiber;
+        // 直接使用 tl_workerMainFiber（已在命名空间内定义），无需 extern 声明
         if (tl_workerMainFiber) {
             SwitchToFiber(tl_workerMainFiber);
         }
@@ -199,7 +183,7 @@ void CALLBACK ParallelDimensionTickManager::dimFiberProc(LPVOID param) {
 // 工作线程：每个维度一个线程，线程内用 fiber 执行 tick
 //=============================================================================
 
-thread_local void* tl_workerMainFiber = nullptr;
+// tl_workerMainFiber 的定义已经移到文件顶部
 
 DWORD WINAPI ParallelDimensionTickManager::workerThreadProc(LPVOID param) {
     auto* ctx = static_cast<DimensionFiberContext*>(param);
