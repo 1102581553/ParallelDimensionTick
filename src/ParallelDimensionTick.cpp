@@ -7,6 +7,7 @@
 #include <mc/world/level/Level.h>
 #include <mc/server/ServerLevel.h>
 #include <mc/world/level/dimension/Dimension.h>
+#include <mc/world/level/Tick.h>
 #include <mc/world/actor/Actor.h>
 #include <mc/network/Packet.h>
 #include <mc/network/PacketSender.h>
@@ -129,18 +130,13 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
     }
 
     // 快照
-    mSnapshot.time        = level->getTime();
-    mSnapshot.currentTick = level->getCurrentTick().tickID;
-    mSnapshot.simPaused   = level->getSimPaused();
+    mSnapshot.time      = level->getTime();
+    mSnapshot.simPaused = level->getSimPaused();
 
     if (mSnapshot.simPaused) return;
 
-    // 收集维度
-    std::vector<Dimension*> dimensions;
-    level->forEachDimension([&](Dimension& dim) -> bool {
-        dimensions.push_back(&dim);
-        return true;
-    });
+    // 使用已收集的维度
+    auto& dimensions = g_collectedDimensions;
 
     if (dimensions.empty()) return;
 
@@ -151,8 +147,8 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
 
     // 准备上下文
     for (auto* dim : dimensions) {
-        int dimId  = dim->getDimensionId();
-        auto& ctx  = mContexts[dimId];
+        int   dimId = dim->getDimensionId();
+        auto& ctx   = mContexts[dimId];
         ctx.dimension = dim;
     }
 
@@ -160,8 +156,8 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
     std::latch completionLatch(static_cast<ptrdiff_t>(dimensions.size()));
 
     for (auto* dim : dimensions) {
-        int dimId = dim->getDimensionId();
-        auto& ctx = mContexts[dimId];
+        int   dimId = dim->getDimensionId();
+        auto& ctx   = mContexts[dimId];
 
         std::thread([this, &ctx, &completionLatch]() {
             tickDimensionOnWorker(ctx);
@@ -241,12 +237,13 @@ void ParallelDimensionTickManager::serialFallbackTick(std::vector<Dimension*>& d
 
 using namespace dim_parallel;
 
-// Hook Dimension::tick() — suppress 模式下只收集指针，parallel 模式下正常执行
+// 虚函数必须用 $ 前缀版本 hook
+
 LL_TYPE_INSTANCE_HOOK(
     DimensionTickHook,
     ll::memory::HookPriority::Normal,
     Dimension,
-    &Dimension::tick,
+    &Dimension::$tick,
     void
 ) {
     if (!config.enabled) {
@@ -255,28 +252,24 @@ LL_TYPE_INSTANCE_HOOK(
     }
 
     if (g_suppressDimensionTick.load(std::memory_order_acquire)) {
-        // Level::tick() 内部的 forEachDimension 调用，只收集不执行
         std::lock_guard lock(g_collectMutex);
         g_collectedDimensions.push_back(this);
         return;
     }
 
     if (g_inParallelPhase.load(std::memory_order_acquire)) {
-        // 工作线程调用，正常执行原始 tick
         origin();
         return;
     }
 
-    // 其他路径（不应该发生），安全执行
     origin();
 }
 
-// Hook Dimension::sendBroadcast() — 工作线程中延迟到主线程
 LL_TYPE_INSTANCE_HOOK(
     DimensionSendBroadcastHook,
     ll::memory::HookPriority::Normal,
     Dimension,
-    &Dimension::sendBroadcast,
+    &Dimension::$sendBroadcast,
     void,
     Packet const& packet,
     Player*       except
@@ -285,26 +278,15 @@ LL_TYPE_INSTANCE_HOOK(
         origin(packet, except);
         return;
     }
-
-    // 在工作线程中，延迟发包到主线程同步阶段
-    // 注意：packet 是栈上引用，不能直接捕获引用
-    // 使用 Packet::sendTo 系列方法在主线程重放更安全
-    // 但这里我们需要调用 origin，所以用 this 指针 + 标志绕过
-    Dimension* self = this;
-    Player*    exc  = except;
-
-    // 暂时直接调用 origin — Phase 2 会改为真正的缓冲
-    // 当前风险：从非主线程调用网络发送
-    // TODO: 实现 packet clone 后改为缓冲模式
+    // Phase 1: 直通，Phase 2 改为缓冲
     origin(packet, except);
 }
 
-// Hook Dimension::sendPacketForPosition() — 工作线程中延迟到主线程
 LL_TYPE_INSTANCE_HOOK(
     DimensionSendPacketForPositionHook,
     ll::memory::HookPriority::Normal,
     Dimension,
-    &Dimension::sendPacketForPosition,
+    &Dimension::$sendPacketForPosition,
     void,
     BlockPos const& position,
     Packet const&   packet,
@@ -314,17 +296,14 @@ LL_TYPE_INSTANCE_HOOK(
         origin(position, packet, except);
         return;
     }
-
-    // TODO: Phase 2 缓冲
     origin(position, packet, except);
 }
 
-// Hook Dimension::sendPacketForEntity() — 工作线程中延迟到主线程
 LL_TYPE_INSTANCE_HOOK(
     DimensionSendPacketForEntityHook,
     ll::memory::HookPriority::Normal,
     Dimension,
-    &Dimension::sendPacketForEntity,
+    &Dimension::$sendPacketForEntity,
     void,
     Actor const&  actor,
     Packet const& packet,
@@ -334,17 +313,14 @@ LL_TYPE_INSTANCE_HOOK(
         origin(actor, packet, except);
         return;
     }
-
-    // TODO: Phase 2 缓冲
     origin(actor, packet, except);
 }
 
-// Hook Level::tick() — 拦截 forEachDimension 中的 dim.tick()，替换为并行
 LL_TYPE_INSTANCE_HOOK(
     LevelTickHook,
     ll::memory::HookPriority::Normal,
     Level,
-    &Level::tick,
+    &Level::$tick,
     void
 ) {
     if (!config.enabled) {
@@ -352,12 +328,12 @@ LL_TYPE_INSTANCE_HOOK(
         return;
     }
 
-    // 阶段 1: suppress dim.tick()，让 origin() 中的 forEachDimension 只收集指针
+    // 阶段 1: suppress dim.tick()
     g_collectedDimensions.clear();
     g_suppressDimensionTick.store(true, std::memory_order_release);
 
     // 调用原始 Level::tick()
-    // tickEntities(), tickEntitySystems(), _subTick() 等正常执行
+    // tickEntities(), tickEntitySystems() 等正常执行
     // forEachDimension 中的 dim.tick() 被 DimensionTickHook 拦截，只收集不执行
     origin();
 
