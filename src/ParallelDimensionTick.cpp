@@ -66,8 +66,7 @@ void MainThreadTaskQueue::processAll() {
     for (auto& task : mProcessing) {
         task();
     }
-    mProcessing.clear();
-}
+   }
 
 size_t MainThreadTaskQueue::size() const {
     std::lock_guard lock(mMutex);
@@ -122,7 +121,7 @@ void ParallelDimensionTickManager::runOnMainThread(std::function<void()> task) {
 }
 
 bool ParallelDimensionTickManager::shouldRecoverFromFallback() {
-    if (!mFallbackToSerial.load(std::memory_order_acquire)) {
+   ToSerial.load(std::memory_order_acquire)) {
         return false;
     }
     
@@ -220,7 +219,7 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level, std::vector<Dim
 
     if (config.debug && (mStats.totalParallelTicks % 50 == 0)) {
         logger().info(
-            "Stats: parallelTicks={} fallbackTicks={} mainThreadTasks={} maxDimTick={}us",
+            "Stats: parallelTicks={} fallbackTicks={} mainDimTick={}us",
             mStats.totalParallelTicks.load(),
             mStats.totalFallbackTicks.load(),
             mStats.totalMainThreadTasks.load(),
@@ -464,7 +463,7 @@ PluginImpl& PluginImpl::getInstance() {
 }
 
 bool PluginImpl::load() {
-    std::filesystem::create_directories(get());
+    std::filesystem::create_directories(getSelf().getConfigDir());
     if (!loadConfig()) {
         logger().warn("Failed to load config, using defaults");
         saveConfig();
@@ -503,4 +502,4 @@ bool PluginImpl::disable() {
 
 } // namespace dim_parallel
 
-LL_REGISTER_MOD(dim_parallel::PluginImpl, dim_parallel::PluginImpl::getInstance());
+LL_REGISTER_MOD(dim_parallel::PluginImpl, dim_parallelgetInstance());
