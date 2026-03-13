@@ -46,7 +46,7 @@ struct LevelTickSnapshot {
 };
 
 struct DimensionWorkerContext {
-    Dimension* dimensionPtr = nullptr; // raw pointer（本 tick 内安全）
+    Dimension* dimensionPtr = nullptr;
     uint64_t lastTickTimeUs = 0;
     MainThreadTaskQueue mainThreadTasks;
     std::thread workerThread;
@@ -55,6 +55,10 @@ struct DimensionWorkerContext {
     bool shouldWork = false;
     bool shutdown = false;
     std::atomic<bool> tickCompleted{false};
+    std::atomic<bool> isProcessing{false};
+    uint64_t tickNumber = 0;
+    uint64_t skippedTicks = 0;
+    uint64_t totalSkippedTicks = 0;
 };
 
 class ParallelDimensionTickManager {
@@ -74,12 +78,13 @@ public:
     struct Stats {
         std::atomic<uint64_t> totalParallelTicks{0};
         std::atomic<uint64_t> totalFallbackTicks{0};
-        std::atomic<uint64_t> totalMainThreadTasks{0};      // 累计（保留，但不用于周期打印）
+        std::atomic<uint64_t> totalMainThreadTasks{0};
         std::atomic<uint64_t> maxDimTickTimeUs{0};
         std::atomic<uint64_t> totalRecoveryAttempts{0};
         std::atomic<uint64_t> totalDangerousFunctions{0};
         std::atomic<uint64_t> totalSkippedDimensions{0};
-        std::atomic<uint64_t> cycleMainThreadTasks{0};      // 新增：当前周期内的主线程任务数
+        std::atomic<uint64_t> cycleMainThreadTasks{0};
+        std::atomic<uint64_t> totalTicksSkippedDueToBacklog{0};
     };
     Stats& getStats() { return mStats; }
 
@@ -98,7 +103,6 @@ private:
     static constexpr uint64_t RECOVERY_INTERVAL_TICKS = 20;
     uint64_t mFallbackStartTick = 0;
 
-    // 修复：危险函数集合静态成员
     static std::unordered_set<std::string> m_dangerousFunctions;
     static std::mutex m_dangerousMutex;
 };
