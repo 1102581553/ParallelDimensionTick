@@ -20,10 +20,9 @@
 namespace dim_parallel {
 
 struct Config {
-    int  version           = 1;
-    bool enabled           = true;
-    bool debug             = false;
-    bool parallelChunkTick = true;
+    int  version = 1;
+    bool enabled = true;
+    bool debug   = false;
 };
 
 Config&         getConfig();
@@ -72,14 +71,13 @@ private:
         std::atomic<int>       doneCount{0};
     };
 
-    std::vector<void*>       mHandles; // HANDLE
+    std::vector<void*>       mHandles;
     std::mutex               mMutex;
     std::condition_variable  mWakeCV;
     Batch                    mBatch;
     uint64_t                 mGeneration = 0;
     bool                     mShutdown   = false;
 };
-
 
 class ParallelDimensionTickManager {
 public:
@@ -101,8 +99,6 @@ public:
         std::atomic<uint64_t> totalFallbackTicks{0};
         std::atomic<uint64_t> totalMainThreadTasks{0};
         std::atomic<uint64_t> maxDimTickTimeUs{0};
-        std::atomic<uint64_t> chunksTickedParallel{0};
-        std::atomic<uint64_t> chunkBatchCount{0};
     };
     Stats& getStats() { return mStats; }
 
