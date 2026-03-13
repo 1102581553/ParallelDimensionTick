@@ -151,48 +151,56 @@ void ParallelDimensionTickManager::workerLoop(DimensionWorkerContext* ctx) {
     tl_currentPhase = "idle";
 }
 
+// SEH 保护的核心 tick 函数（无 C++ 对象，避免析构冲突）
+static DWORD tickDimensionCore(Dimension* dim) {
+    __try {
+        if (dim) {
+            dim->tick();
+        }
+        return 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return GetExceptionCode();
+    }
+}
+
 void ParallelDimensionTickManager::tickDimensionOnWorker(DimensionWorkerContext& ctx) {
     tl_currentPhase = "pre-tick";
     auto start = std::chrono::steady_clock::now();
+    bool faulted = false;
+    DWORD exceptionCode = 0;
 
-    // 使用 Windows SEH 捕获访问违规等硬件异常
-    __try {
-        tl_currentPhase = "tick";
-        if (ctx.dimensionPtr) {
-            ctx.dimensionPtr->tick();
-        }
-        tl_currentPhase = "post-tick";
-    }
-    __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
-        // 捕获到访问违规，标记当前阶段为危险
+    tl_currentPhase = "tick";
+    exceptionCode = tickDimensionCore(ctx.dimensionPtr);
+    
+    if (exceptionCode != 0) {
+        faulted = true;
         const char* faultPhase = tl_currentPhase;
         mStats.totalSEHCaught.fetch_add(1, std::memory_order_relaxed);
 
-        logger().error("SEH access violation in dim {} during [{}], auto-marking dangerous and falling back",
-            tl_currentDimTypeId, faultPhase);
+        logger().error("SEH exception (code: 0x{:X}) in dim {} during [{}], auto-marking dangerous",
+            exceptionCode, tl_currentDimTypeId, faultPhase);
 
         if (faultPhase && faultPhase[0] != '\0' &&
             strcmp(faultPhase, "pre-tick") != 0 &&
             strcmp(faultPhase, "post-tick") != 0 &&
-            strcmp(faultPhase, "idle") != 0) {
+            strcmp(faultPhase, "idle") != 0 &&
+            strcmp(faultPhase, "tick") != 0) {
             markFunctionDangerous(faultPhase);
         }
 
         ctx.tickFaulted.store(true, std::memory_order_release);
         mFallbackToSerial.store(true, std::memory_order_relaxed);
+    }
 
-        auto end = std::chrono::steady_clock::now();
-        ctx.lastTickTimeUs = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+    tl_currentPhase = "post-tick";
+    auto end = std::chrono::steady_clock::now();
+    ctx.lastTickTimeUs = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+
+    if (faulted) {
         tl_currentPhase = "idle";
         return;
     }
-
-    // C++ 异常也捕获
-    // 注意：__try/__except 不能和 C++ try/catch 在同一函数中混用
-    // 所以 C++ 异常在子函数 hook 层面已经被 handleDangerousFunction 处理
-
-    auto end = std::chrono::steady_clock::now();
-    ctx.lastTickTimeUs = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
 
     uint64_t expected = mStats.maxDimTickTimeUs.load(std::memory_order_relaxed);
     while (ctx.lastTickTimeUs > expected) {
@@ -386,7 +394,7 @@ void ParallelDimensionTickManager::serialFallbackTick(const std::vector<Dimensio
 
 //=============================================================================
 // Hook helper - 自动适应：首次在 worker 线程直接执行，
-// 如果被 SEH 捕获则自动标记，后续转发主线程
+// 如果被 SEH 捕获则自动标记,后续转发主线程
 //=============================================================================
 
 template<typename Func, typename... Args>
