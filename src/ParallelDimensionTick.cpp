@@ -278,7 +278,7 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level, std::vector<Dim
 void ParallelDimensionTickManager::tickDimensionOnWorker(DimensionWorkerContext& ctx) {
     tl_isWorkerThread  = true;
     tl_currentContext   = &ctx;
-    tl_currentDimTypeId = ctx.dimension->getDimensionId();
+    tl_currentDimTypeId = static_cast<int>(ctx.dimension->getDimensionId());
     tl_currentPhase     = "pre-tick";
 
     auto start = std::chrono::steady_clock::now();
