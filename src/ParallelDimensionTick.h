@@ -15,6 +15,7 @@
 #include <unordered_set>
 #include <vector>
 #include <string>
+#include <Windows.h>
 
 namespace dim_parallel {
 
@@ -95,10 +96,11 @@ struct DimensionWorkerContext {
     std::atomic<uint64_t> totalSkippedTicks{0};
 };
 
+// SEH 结果结构体 - 使用 POD 类型
 struct TickResult {
     DWORD exceptionCode;
     bool success;
-    std::string phase;
+    char phase[64];
 };
 
 class ParallelDimensionTickManager {
