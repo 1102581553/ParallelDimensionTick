@@ -184,6 +184,7 @@ void ParallelDimensionTickManager::tickDimensionOnWorker(DimensionWorkerContext&
         mStats.totalSEHCaught.fetch_add(1, std::memory_order_relaxed);
         
         std::string phaseStr(tl_currentPhase);
+        // 修改这里：转换为 int
         logger().error("SEH 异常 (代码: 0x{:X}) 发生在维度 {} 的 [{}] 阶段",
             exceptionCode, tl_currentDimTypeId, phaseStr);
         
@@ -214,6 +215,7 @@ void ParallelDimensionTickManager::tickDimensionOnWorker(DimensionWorkerContext&
 
     strncpy_s(tl_currentPhase, "idle", _TRUNCATE);
 }
+
 
 void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
     if (!level || !mInitialized) {
@@ -400,7 +402,8 @@ void ParallelDimensionTickManager::serialFallbackTick(const std::vector<Dimensio
             try {
                 dim->tick();
             } catch (...) {
-                logger().error("串行 tick 维度 {} 时发生异常", dim->getDimensionId());
+                // 修改这里：转换为 int
+                logger().error("串行 tick 维度 {} 时发生异常", static_cast<int>(dim->getDimensionId()));
             }
         }
     }
