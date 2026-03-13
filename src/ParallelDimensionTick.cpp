@@ -121,13 +121,12 @@ void WorkerPool::executeAll(std::vector<std::function<void()>>& tasks) {
     if (tasks.empty()) return;
     int count = static_cast<int>(tasks.size());
 
-    mBatch.tasks = tasks.data();
-    mBatch.count = count;
-    mBatch.nextIdx.store(0, std::memory_order_relaxed);
-    mBatch.doneCount.store(0, std::memory_order_relaxed);
-
     {
         std::lock_guard lock(mMutex);
+        mBatch.tasks = tasks.data();
+        mBatch.count = count;
+        mBatch.nextIdx.store(0, std::memory_order_relaxed);
+        mBatch.doneCount.store(0, std::memory_order_relaxed);
         mGeneration++;
     }
     mWakeCV.notify_all();
@@ -143,8 +142,11 @@ void WorkerPool::executeAll(std::vector<std::function<void()>>& tasks) {
         std::this_thread::yield();
     }
 
-    mBatch.tasks = nullptr;
-    mBatch.count = 0;
+    {
+        std::lock_guard lock(mMutex);
+        mBatch.tasks = nullptr;
+        mBatch.count = 0;
+    }
 }
 
 void WorkerPool::workerLoop() {
@@ -234,6 +236,7 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
         ctx.dimension = dim;
     }
 
+    // === 并行阶段：维度 tick（_processEntityChunkTransfers 被跳过）===
     std::vector<std::function<void()>> dimTasks;
     dimTasks.reserve(dimensions.size());
     for (auto* dim : dimensions) {
@@ -243,6 +246,21 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
     }
 
     mPool.executeAll(dimTasks);
+
+    // === 串行阶段：主线程补上并行阶段跳过的 _processEntityChunkTransfers ===
+    for (auto* dim : dimensions) {
+        try {
+            dim->_processEntityChunkTransfers();
+        } catch (std::exception& e) {
+            logger().error("Exception in serial _processEntityChunkTransfers dim {}: {}",
+                dim->getDimensionId(), e.what());
+        } catch (...) {
+            logger().error("SEH in serial _processEntityChunkTransfers dim {}",
+                dim->getDimensionId());
+        }
+    }
+
+    // flush 主线程延迟任务
     processAllMainThreadTasks();
 
     mStats.totalParallelTicks++;
@@ -315,6 +333,10 @@ void ParallelDimensionTickManager::serialFallbackTick(std::vector<Dimension*>& d
 
 using namespace dim_parallel;
 
+// ============================================================
+// Hooks
+// ============================================================
+
 LL_TYPE_INSTANCE_HOOK(
     DimensionTickRedstoneHook,
     ll::memory::HookPriority::Normal,
@@ -353,6 +375,7 @@ LL_TYPE_INSTANCE_HOOK(
     }
 }
 
+// 关键修改：并行阶段跳过 _processEntityChunkTransfers
 LL_TYPE_INSTANCE_HOOK(
     DimensionProcessEntityTransfersHook,
     ll::memory::HookPriority::Normal,
@@ -360,16 +383,17 @@ LL_TYPE_INSTANCE_HOOK(
     &Dimension::_processEntityChunkTransfers,
     void
 ) {
-    if (!config.enabled || !ParallelDimensionTickManager::isWorkerThread()) {
+    if (!config.enabled) {
         origin();
         return;
     }
-    tl_currentPhase = "_processEntityChunkTransfers";
-    try { origin(); }
-    catch (...) {
-        logger().error("Exception in dim {} during _processEntityChunkTransfers", tl_currentDimTypeId);
-        throw;
+
+    // 并行阶段中被调用时直接跳过，由主线程串行补上
+    if (g_inParallelPhase.load(std::memory_order_acquire)) {
+        return;
     }
+
+    origin();
 }
 
 LL_TYPE_INSTANCE_HOOK(
@@ -506,6 +530,10 @@ LL_TYPE_INSTANCE_HOOK(
         g_inParallelPhase.store(false, std::memory_order_release);
     }
 }
+
+// ============================================================
+// Plugin lifecycle
+// ============================================================
 
 namespace dim_parallel {
 
