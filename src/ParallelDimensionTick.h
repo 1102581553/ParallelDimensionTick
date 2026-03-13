@@ -22,7 +22,7 @@ struct Config {
     int version = 1;
     bool enabled = true;
     bool debug = false;
-    int workerStackSizeMB = 8; // 工作线程栈大小（MB）
+    int workerStackSizeMB = 64; // 工作线程栈大小（MB）
 };
 
 Config& getConfig();
