@@ -2,6 +2,7 @@
 
 #include <ll/api/Config.h>
 #include <ll/api/io/Logger.h>
+#include <ll/api/io/LoggerRegistry.h>
 #include <ll/api/mod/NativeMod.h>
 
 #include <mc/world/level/BlockPos.h>
@@ -58,10 +59,9 @@ public:
     void start(int numWorkers);
     void stop();
     void executeAll(std::vector<std::function<void()>>& tasks);
-    int  workerCount() const { return static_cast<int>(mHandles.size()); }
+    int  workerCount() const { return static_cast<int>(mThreads.size()); }
 
 private:
-    static unsigned long __stdcall threadEntry(void* param);
     void workerLoop();
 
     struct Batch {
@@ -71,12 +71,12 @@ private:
         std::atomic<int>       doneCount{0};
     };
 
-    std::vector<void*>       mHandles;
-    std::mutex               mMutex;
-    std::condition_variable  mWakeCV;
-    Batch                    mBatch;
-    uint64_t                 mGeneration = 0;
-    bool                     mShutdown   = false;
+    std::vector<std::thread>   mThreads;
+    std::mutex                 mMutex;
+    std::condition_variable    mWakeCV;
+    Batch                      mBatch;
+    uint64_t                   mGeneration = 0;
+    bool                       mShutdown   = false;
 };
 
 class ParallelDimensionTickManager {
@@ -85,7 +85,7 @@ public:
 
     void initialize();
     void shutdown();
-    void dispatchAndSync(class Level* level);
+    void dispatchAndSync(class Level* level, std::vector<Dimension*>& dimensions);
 
     static bool                    isWorkerThread();
     static DimensionWorkerContext* getCurrentContext();
@@ -113,6 +113,8 @@ private:
     LevelTickSnapshot                               mSnapshot;
     WorkerPool                                      mPool;
     std::atomic<bool>                               mFallbackToSerial{false};
+    std::atomic<int64_t>                            mLastFallbackGameTime{0};
+    static constexpr int64_t                        RECOVERY_DELAY = 200;
     bool                                            mInitialized = false;
     Stats                                           mStats;
 };
