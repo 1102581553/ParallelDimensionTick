@@ -14,6 +14,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <deque>
 
 namespace dim_parallel {
 
@@ -28,110 +29,46 @@ bool loadConfig();
 bool saveConfig();
 ll::io::Logger& logger();
 
-// 无锁队列节点
-template<typename T>
-struct LockFreeNode {
-    T data;
-    std::atomic<LockFreeNode*> next;
-    
-    explicit LockFreeNode(T&& d) : data(std::move(d)), next(nullptr) {}
-};
-
-// 无锁队列实现
-template<typename T>
-class LockFreeQueue {
+// 简化的无锁任务队列（使用批处理减少竞争）
+class MainThreadTaskQueue {
 public:
-    LockFreeQueue() {
-        auto dummy = new LockFreeNode<T>(T{});
-        mHead.store(dummy, std::memory_order_relaxed);
-        mTail.store(dummy, std::memory_order_relaxed);
-        mSize.store(0, std::memory_order_relaxed);
+    MainThreadTaskQueue() : mWriteBuffer(0) {}
+
+    void enqueue(std::function<void()> task) {
+        int writeIdx = mWriteBuffer.load(std::memory_order_relaxed);
+        std::lock_guard lock(mBufferMutex[writeIdx]);
+        mBuffers[writeIdx].push_back(std::move(task));
     }
 
-    ~LockFreeQueue() {
-        while (auto node = mHead.load(std::memory_order_relaxed)) {
-            mHead.store(node->next.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            delete node;
-        }
-    }
-
-    void enqueue(T item) {
-        auto node = new LockFreeNode<T>(std::move(item));
-        LockFreeNode<T>* tail = nullptr;
+    void processAll() {
+        // 切换缓冲区
+        int readIdx = mWriteBuffer.exchange(1 - mWriteBuffer.load(std::memory_order_relaxed), 
+                                            std::memory_order_acquire);
         
-        while (true) {
-            tail = mTail.load(std::memory_order_acquire);
-            LockFreeNode<T>* next = tail->next.load(std::memory_order_acquire);
-            
-            if (tail == mTail.load(std::memory_order_acquire)) {
-                if (next == nullptr) {
-                    if (tail->next.compare_exchange_weak(next, node, 
-                        std::memory_order_release, std::memory_order_relaxed)) {
-                        break;
-                    }
-                } else {
-                    mTail.compare_exchange_weak(tail, next, 
-                        std::memory_order_release, std::memory_order_relaxed);
-                }
-            }
+        std::vector<std::function<void()>> tasks;
+        {
+            std::lock_guard lock(mBufferMutex[readIdx]);
+            tasks.swap(mBuffers[readIdx]);
         }
         
-        mTail.compare_exchange_strong(tail, node, 
-            std::memory_order_release, std::memory_order_relaxed);
-        mSize.fetch_add(1, std::memory_order_relaxed);
-    }
-
-    bool dequeue(T& result) {
-        while (true) {
-            LockFreeNode<T>* head = mHead.load(std::memory_order_acquire);
-            LockFreeNode<T>* tail = mTail.load(std::memory_order_acquire);
-            LockFreeNode<T>* next = head->next.load(std::memory_order_acquire);
-            
-            if (head == mHead.load(std::memory_order_acquire)) {
-                if (head == tail) {
-                    if (next == nullptr) {
-                        return false;
-                    }
-                    mTail.compare_exchange_weak(tail, next, 
-                        std::memory_order_release, std::memory_order_relaxed);
-                } else {
-                    result = std::move(next->data);
-                    if (mHead.compare_exchange_weak(head, next, 
-                        std::memory_order_release, std::memory_order_relaxed)) {
-                        mSize.fetch_sub(1, std::memory_order_relaxed);
-                        delete head;
-                        return true;
-                    }
-                }
-            }
+        for (auto& task : tasks) {
+            task();
         }
     }
 
     size_t size() const {
-        return mSize.load(std::memory_order_relaxed);
-    }
-
-    bool empty() const {
-        return size() == 0;
+        size_t total = 0;
+        for (int i = 0; i < 2; ++i) {
+            std::lock_guard lock(mBufferMutex[i]);
+            total += mBuffers[i].size();
+        }
+        return total;
     }
 
 private:
-    std::atomic<LockFreeNode<T>*> mHead;
-    std::atomic<LockFreeNode<T>*> mTail;
-    std::atomic<size_t> mSize;
-    
-    LockFreeQueue(const LockFreeQueue&) = delete;
-    LockFreeQueue& operator=(const LockFreeQueue&) = delete;
-};
-
-class MainThreadTaskQueue {
-public:
-    void enqueue(std::function<void()> task);
-    void processAll();
-    size_t size() const;
-
-private:
-    LockFreeQueue<std::function<void()>> mQueue;
+    std::atomic<int> mWriteBuffer;
+    mutable std::mutex mBufferMutex[2];
+    std::vector<std::function<void()>> mBuffers[2];
 };
 
 struct LevelTickSnapshot {
