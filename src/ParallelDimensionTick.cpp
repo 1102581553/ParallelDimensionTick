@@ -171,7 +171,7 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level, std::vector<Dim
 
     // 准备维度上下文和线程
     for (auto* dim : dimensions) {
-        int dimId = dim->getDimensionId();
+        int dimId = static_cast<int>(dim->getDimensionId());
         auto& ctx = mContexts[dimId];
         if (!ctx) {
             ctx = std::make_unique<DimensionWorkerContext>();
@@ -187,7 +187,7 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level, std::vector<Dim
     pendingDimensions.store(static_cast<int>(dimensions.size()), std::memory_order_release);
 
     for (auto* dim : dimensions) {
-        int dimId = dim->getDimensionId();
+        int dimId = static_cast<int>(dim->getDimensionId());
         auto& ctx = mContexts[dimId];
         
         // 添加tick任务到该维度的专属线程
@@ -233,7 +233,7 @@ void ParallelDimensionTickManager::tickDimensionAsync(DimensionWorkerContext& ct
     // 设置线程局部变量
     tl_isWorkerThread = true;
     tl_currentContext = &ctx;
-    tl_currentDimTypeId = ctx.dimension->getDimensionId();
+    tl_currentDimTypeId = ctx.dimension ? static_cast<int>(ctx.dimension->getDimensionId()) : -1;
     tl_currentPhase = "pre-tick";
 
     auto start = std::chrono::steady_clock::now();
@@ -249,11 +249,11 @@ void ParallelDimensionTickManager::tickDimensionAsync(DimensionWorkerContext& ct
     } catch (std::exception& e) {
         logger().error("Exception in dim {} during [{}]: {}", 
             tl_currentDimTypeId, tl_currentPhase, e.what());
-        handleTickException(ctx.dimension->getDimensionId());
+        handleTickException(tl_currentDimTypeId);
     } catch (...) {
         logger().error("SEH/unknown exception in dim {} during [{}]", 
             tl_currentDimTypeId, tl_currentPhase);
-        handleTickException(ctx.dimension->getDimensionId());
+        handleTickException(tl_currentDimTypeId);
     }
 
     auto end = std::chrono::steady_clock::now();
@@ -402,7 +402,7 @@ LL_TYPE_INSTANCE_HOOK(
         std::lock_guard lock(g_collectMutex);
         g_collectedDimensions.push_back(this);
         if (config.debug) {
-            logger().info("Collecting dimension {} for parallel tick", this->getDimensionId());
+            logger().info("Collecting dimension {} for parallel tick", static_cast<int>(this->getDimensionId()));
         }
         return;
     }
@@ -464,7 +464,7 @@ PluginImpl& PluginImpl::getInstance() {
 }
 
 bool PluginImpl::load() {
-    std::filesystem::create_directories(getSelf().getConfigDir());
+    std::filesystem::create_directories(get());
     if (!loadConfig()) {
         logger().warn("Failed to load config, using defaults");
         saveConfig();
