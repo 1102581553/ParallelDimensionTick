@@ -49,9 +49,9 @@ struct LevelTickSnapshot {
 };
 
 struct DimensionWorkerContext {
-    Dimension*          dimension = nullptr;
+    WeakRef<Dimension>  dimensionRef;        // Use WeakRef for safety
     uint64_t            lastTickTimeUs = 0;
-    MainThreadTaskQueue mainThreadTasks;  // Per-dimension task queue
+    MainThreadTaskQueue mainThreadTasks;     // Per-dimension task queue
 
     // Per-dimension thread resources
     std::thread                 workerThread;
@@ -75,7 +75,7 @@ public:
     static DimensionType           getCurrentDimensionType();
     static void                    runOnMainThread(std::function<void()> task);
 
-    // Record a function that caused an exception in worker thread
+    // Dangerous function management
     static void markFunctionDangerous(const std::string& funcName);
     static bool isFunctionDangerous(const std::string& funcName);
 
@@ -86,6 +86,7 @@ public:
         std::atomic<uint64_t> maxDimTickTimeUs{0};
         std::atomic<uint64_t> totalRecoveryAttempts{0};
         std::atomic<uint64_t> totalDangerousFunctions{0};
+        std::atomic<uint64_t> totalSkippedDimensions{0};   // Dimensions skipped due to invalid pointer
     };
     Stats& getStats() { return mStats; }
 
@@ -93,7 +94,7 @@ private:
     ParallelDimensionTickManager() = default;
 
     void tickDimensionOnWorker(DimensionWorkerContext& ctx);
-    void serialFallbackTick(std::vector<Dimension*>& dimensions);
+    void serialFallbackTick(const std::vector<WeakRef<Dimension>>& dimensions);
     void workerLoop(DimensionWorkerContext* ctx);
 
     std::unordered_map<int, std::unique_ptr<DimensionWorkerContext>> mContexts;
