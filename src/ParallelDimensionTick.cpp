@@ -267,12 +267,11 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
 
     if (config.debug && (mStats.totalParallelTicks % 200 == 0)) {
         logger().info(
-            "Parallel tick #{}: dims={}  mainTasks={}  fallbacks={}  workers={}  dangerous={}  recoveryAttempts={}",
+            "Parallel tick #{}: dims={}  mainTasks={}  fallbacks={}  dangerous={}  recoveryAttempts={}",
             mStats.totalParallelTicks.load(),
             dimensions.size(),
             mStats.totalMainThreadTasks.load(),
             mStats.totalFallbackTicks.load(),
-            mContexts.size(),
             mStats.totalDangerousFunctions.load(),
             mStats.totalRecoveryAttempts.load()
         );
@@ -296,13 +295,15 @@ void ParallelDimensionTickManager::tickDimensionOnWorker(DimensionWorkerContext&
         tl_currentPhase = "post-tick";
     } catch (std::exception& e) {
         logger().error("std::exception in dim {} during [{}]: {}", tl_currentDimTypeId, tl_currentPhase, e.what());
-        if (tl_currentPhase != nullptr && tl_currentPhase[0] != '\0' && strcmp(tl_currentPhase, "pre-tick") != 0 && strcmp(tl_currentPhase, "post-tick") != 0) {
+        if (tl_currentPhase != nullptr && tl_currentPhase[0] != '\0' && 
+            strcmp(tl_currentPhase, "pre-tick") != 0 && strcmp(tl_currentPhase, "post-tick") != 0) {
             markFunctionDangerous(tl_currentPhase);
         }
         mFallbackToSerial.store(true, std::memory_order_relaxed);
     } catch (...) {
         logger().error("SEH/unknown exception in dim {} during [{}]", tl_currentDimTypeId, tl_currentPhase);
-        if (tl_currentPhase != nullptr && tl_currentPhase[0] != '\0' && strcmp(tl_currentPhase, "pre-tick") != 0 && strcmp(tl_currentPhase, "post-tick") != 0) {
+        if (tl_currentPhase != nullptr && tl_currentPhase[0] != '\0' && 
+            strcmp(tl_currentPhase, "pre-tick") != 0 && strcmp(tl_currentPhase, "post-tick") != 0) {
             markFunctionDangerous(tl_currentPhase);
         }
         mFallbackToSerial.store(true, std::memory_order_relaxed);
@@ -359,7 +360,7 @@ inline void handleDangerousFunction(const char* funcName, Func&& func, Args&&...
 }
 
 //=============================================================================
-// Hooks
+// Hooks (all sub-functions now use handleDangerousFunction)
 //=============================================================================
 
 LL_TYPE_INSTANCE_HOOK(
@@ -369,17 +370,9 @@ LL_TYPE_INSTANCE_HOOK(
     &Dimension::$tickRedstone,
     void
 ) {
-    if (!config.enabled || !ParallelDimensionTickManager::isWorkerThread()) {
-        origin();
-        return;
-    }
-    tl_currentPhase = "tickRedstone";
-    try {
-        origin();
-    } catch (...) {
-        logger().error("Exception in dim {} during tickRedstone", tl_currentDimTypeId);
-        throw;
-    }
+    const char* funcName = "tickRedstone";
+    tl_currentPhase = funcName;
+    handleDangerousFunction(funcName, [this]() { origin(); });
 }
 
 LL_TYPE_INSTANCE_HOOK(
@@ -389,20 +382,11 @@ LL_TYPE_INSTANCE_HOOK(
     &Dimension::_sendBlocksChangedPackets,
     void
 ) {
-    if (!config.enabled || !ParallelDimensionTickManager::isWorkerThread()) {
-        origin();
-        return;
-    }
-    tl_currentPhase = "_sendBlocksChangedPackets";
-    try {
-        origin();
-    } catch (...) {
-        logger().error("Exception in dim {} during _sendBlocksChangedPackets", tl_currentDimTypeId);
-        throw;
-    }
+    const char* funcName = "_sendBlocksChangedPackets";
+    tl_currentPhase = funcName;
+    handleDangerousFunction(funcName, [this]() { origin(); });
 }
 
-// Hook for _processEntityChunkTransfers with dangerous function check
 LL_TYPE_INSTANCE_HOOK(
     DimensionProcessEntityTransfersHook,
     ll::memory::HookPriority::Normal,
@@ -415,7 +399,6 @@ LL_TYPE_INSTANCE_HOOK(
     handleDangerousFunction(funcName, [this]() { origin(); });
 }
 
-// Hook for _tickEntityChunkMoves (NEW)
 LL_TYPE_INSTANCE_HOOK(
     DimensionTickEntityChunkMovesHook,
     ll::memory::HookPriority::Normal,
@@ -428,7 +411,6 @@ LL_TYPE_INSTANCE_HOOK(
     handleDangerousFunction(funcName, [this]() { origin(); });
 }
 
-// Hook for _runChunkGenerationWatchdog with dangerous function check
 LL_TYPE_INSTANCE_HOOK(
     DimensionRunChunkGenWatchdogHook,
     ll::memory::HookPriority::Normal,
@@ -441,7 +423,49 @@ LL_TYPE_INSTANCE_HOOK(
     handleDangerousFunction(funcName, [this]() { origin(); });
 }
 
-// Other hooks that may need dangerous check in the future can follow same pattern
+LL_TYPE_INSTANCE_HOOK(
+    DimensionSendBroadcastHook,
+    ll::memory::HookPriority::Normal,
+    Dimension,
+    &Dimension::$sendBroadcast,
+    void,
+    Packet const& packet,
+    Player*       except
+) {
+    const char* funcName = "sendBroadcast";
+    tl_currentPhase = funcName;
+    handleDangerousFunction(funcName, [this, &packet, except]() { origin(packet, except); });
+}
+
+LL_TYPE_INSTANCE_HOOK(
+    DimensionSendPacketForPositionHook,
+    ll::memory::HookPriority::Normal,
+    Dimension,
+    &Dimension::$sendPacketForPosition,
+    void,
+    BlockPos const& position,
+    Packet const&   packet,
+    Player const*   except
+) {
+    const char* funcName = "sendPacketForPosition";
+    tl_currentPhase = funcName;
+    handleDangerousFunction(funcName, [this, &position, &packet, except]() { origin(position, packet, except); });
+}
+
+LL_TYPE_INSTANCE_HOOK(
+    DimensionSendPacketForEntityHook,
+    ll::memory::HookPriority::Normal,
+    Dimension,
+    &Dimension::$sendPacketForEntity,
+    void,
+    Actor const&  actor,
+    Packet const& packet,
+    Player const* except
+) {
+    const char* funcName = "sendPacketForEntity";
+    tl_currentPhase = funcName;
+    handleDangerousFunction(funcName, [this, &actor, &packet, except]() { origin(actor, packet, except); });
+}
 
 LL_TYPE_INSTANCE_HOOK(
     DimensionTickHook,
@@ -464,58 +488,6 @@ LL_TYPE_INSTANCE_HOOK(
         return;
     }
     origin();
-}
-
-LL_TYPE_INSTANCE_HOOK(
-    DimensionSendBroadcastHook,
-    ll::memory::HookPriority::Normal,
-    Dimension,
-    &Dimension::$sendBroadcast,
-    void,
-    Packet const& packet,
-    Player*       except
-) {
-    // Could also apply dangerous check, but for simplicity keep direct origin for now
-    // We'll use the same pattern if needed
-    if (!config.enabled || !ParallelDimensionTickManager::isWorkerThread()) {
-        origin(packet, except);
-        return;
-    }
-    origin(packet, except);
-}
-
-LL_TYPE_INSTANCE_HOOK(
-    DimensionSendPacketForPositionHook,
-    ll::memory::HookPriority::Normal,
-    Dimension,
-    &Dimension::$sendPacketForPosition,
-    void,
-    BlockPos const& position,
-    Packet const&   packet,
-    Player const*   except
-) {
-    if (!config.enabled || !ParallelDimensionTickManager::isWorkerThread()) {
-        origin(position, packet, except);
-        return;
-    }
-    origin(position, packet, except);
-}
-
-LL_TYPE_INSTANCE_HOOK(
-    DimensionSendPacketForEntityHook,
-    ll::memory::HookPriority::Normal,
-    Dimension,
-    &Dimension::$sendPacketForEntity,
-    void,
-    Actor const&  actor,
-    Packet const& packet,
-    Player const* except
-) {
-    if (!config.enabled || !ParallelDimensionTickManager::isWorkerThread()) {
-        origin(actor, packet, except);
-        return;
-    }
-    origin(actor, packet, except);
 }
 
 LL_TYPE_INSTANCE_HOOK(
@@ -570,7 +542,7 @@ bool PluginImpl::enable() {
         DimensionTickRedstoneHook::hook();
         DimensionSendBlocksChangedHook::hook();
         DimensionProcessEntityTransfersHook::hook();
-        DimensionTickEntityChunkMovesHook::hook();  // New hook
+        DimensionTickEntityChunkMovesHook::hook();
         DimensionRunChunkGenWatchdogHook::hook();
         DimensionSendBroadcastHook::hook();
         DimensionSendPacketForPositionHook::hook();
