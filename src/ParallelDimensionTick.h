@@ -165,14 +165,13 @@ public:
     void shutdown();
     void dispatchAndSync(class Level* level, std::vector<Dimension*>& dimensions);
 
-    static bool                    isWorkerThread();
-    static DimensionWorkerContext* getCurrentContext();
+    static bool                    isWorker DimensionWorkerContext* getCurrentContext();
     static int                     getCurrentDimensionType(); // 返回 int 类型
     static void                    runOnMainThread(std::function<void()> task);
 
     struct Stats {
         std::atomic<uint64_t> totalParallelTicks{0};
-        std::atomic<uint64_t>0};
+        std::atomic<uint64_t> totalFallbackTicks{0};
         std::atomic<uint64_t> totalMainThreadTasks{0};
         std::atomic<uint64_t> maxDimTickTimeUs{0};
     };
