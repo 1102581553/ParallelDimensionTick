@@ -59,10 +59,11 @@ public:
     void start(int numWorkers);
     void stop();
     void executeAll(std::vector<std::function<void()>>& tasks);
-    int  workerCount() const { return static_cast<int>(mWorkers.size()); }
+    int  workerCount() const { return static_cast<int>(mHandles.size()); }
 
 private:
-    void workerLoop(int workerId);
+    static unsigned long __stdcall threadEntry(void* param);
+    void workerLoop();
 
     struct Batch {
         std::function<void()>* tasks    = nullptr;
@@ -71,13 +72,14 @@ private:
         std::atomic<int>       doneCount{0};
     };
 
-    std::vector<std::thread> mWorkers;
+    std::vector<void*>       mHandles; // HANDLE
     std::mutex               mMutex;
     std::condition_variable  mWakeCV;
     Batch                    mBatch;
     uint64_t                 mGeneration = 0;
     bool                     mShutdown   = false;
 };
+
 
 class ParallelDimensionTickManager {
 public:
