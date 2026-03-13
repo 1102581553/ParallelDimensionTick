@@ -80,8 +80,8 @@ struct DimensionWorkerContext {
             workerThread = std::thread([this]() {
                 #ifdef _WIN32
                 wchar_t name[64];
-                swprintf_s(name, L"Dim_%d_Thread", 
-                         this->dimension ? this->dimension->getDimensionId() : -1);
+                swprintf_s(name, 64, L"Dim_%d_Thread", 
+                         this->dimension ? static_cast<int>(this->dimension->getDimensionId()) : -1);
                 SetThreadDescription(GetCurrentThread(), name);
                 #endif
                 
@@ -114,7 +114,7 @@ struct DimensionWorkerContext {
                             task();
                         } catch (...) {
                             logger().error("Exception in dimension {} thread task", 
-                                         dimension ? dimension->getDimensionId() : -1);
+                                         dimension ? static_cast<int>(dimension->getDimensionId()) : -1);
                         }
                         isWorking.store(false, std::memory_order_release);
                         
@@ -167,12 +167,12 @@ public:
 
     static bool                    isWorkerThread();
     static DimensionWorkerContext* getCurrentContext();
-    static int                     getCurrentDimensionType();
+    static int                     getCurrentDimensionType(); // 返回 int 类型
     static void                    runOnMainThread(std::function<void()> task);
 
     struct Stats {
         std::atomic<uint64_t> totalParallelTicks{0};
-        std::atomic<uint64_t> totalFallbackTicks{0};
+        std::atomic<uint64_t>0};
         std::atomic<uint64_t> totalMainThreadTasks{0};
         std::atomic<uint64_t> maxDimTickTimeUs{0};
     };
