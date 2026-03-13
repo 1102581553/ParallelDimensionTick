@@ -35,6 +35,9 @@ static std::atomic<bool>       g_suppressDimensionTick{false};
 static std::vector<Dimension*> g_collectedDimensions;
 static std::mutex              g_collectMutex;
 
+// 诊断：记录崩溃发生在哪个子阶段
+static thread_local const char* tl_currentPhase = "unknown";
+
 // ==================== 配置与日志 ====================
 
 Config& getConfig() { return config; }
@@ -135,7 +138,6 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
 
     if (mSnapshot.simPaused) return;
 
-    // 使用已收集的维度
     auto& dimensions = g_collectedDimensions;
 
     if (dimensions.empty()) return;
@@ -190,16 +192,25 @@ void ParallelDimensionTickManager::tickDimensionOnWorker(DimensionWorkerContext&
     tl_isWorkerThread  = true;
     tl_currentContext   = &ctx;
     tl_currentDimTypeId = ctx.dimension->getDimensionId();
+    tl_currentPhase     = "pre-tick";
 
     auto start = std::chrono::steady_clock::now();
 
     try {
+        tl_currentPhase = "tick";
         ctx.dimension->tick();
+        tl_currentPhase = "post-tick";
     } catch (std::exception& e) {
-        logger().error("Exception in dim {} tick: {}", tl_currentDimTypeId, e.what());
+        logger().error(
+            "std::exception in dim {} during [{}]: {}",
+            tl_currentDimTypeId, tl_currentPhase, e.what()
+        );
         mFallbackToSerial = true;
     } catch (...) {
-        logger().error("Unknown exception in dim {} tick", tl_currentDimTypeId);
+        logger().error(
+            "SEH/unknown exception in dim {} during [{}]",
+            tl_currentDimTypeId, tl_currentPhase
+        );
         mFallbackToSerial = true;
     }
 
@@ -214,6 +225,7 @@ void ParallelDimensionTickManager::tickDimensionOnWorker(DimensionWorkerContext&
     tl_isWorkerThread  = false;
     tl_currentContext   = nullptr;
     tl_currentDimTypeId = -1;
+    tl_currentPhase     = "idle";
 }
 
 void ParallelDimensionTickManager::processAllMainThreadTasks() {
@@ -237,7 +249,109 @@ void ParallelDimensionTickManager::serialFallbackTick(std::vector<Dimension*>& d
 
 using namespace dim_parallel;
 
-// 虚函数必须用 $ 前缀版本 hook
+// Hook Dimension 内部的子调用，用于诊断崩溃位置
+
+LL_TYPE_INSTANCE_HOOK(
+    DimensionTickRedstoneHook,
+    ll::memory::HookPriority::Normal,
+    Dimension,
+    &Dimension::$tickRedstone,
+    void
+) {
+    if (!config.enabled || !ParallelDimensionTickManager::isWorkerThread()) {
+        origin();
+        return;
+    }
+    tl_currentPhase = "tickRedstone";
+    try {
+        origin();
+    } catch (...) {
+        logger().error("Exception in dim {} during tickRedstone", tl_currentDimTypeId);
+        throw;
+    }
+}
+
+LL_TYPE_INSTANCE_HOOK(
+    DimensionSendBlocksChangedHook,
+    ll::memory::HookPriority::Normal,
+    Dimension,
+    &Dimension::_sendBlocksChangedPackets,
+    void
+) {
+    if (!config.enabled || !ParallelDimensionTickManager::isWorkerThread()) {
+        origin();
+        return;
+    }
+    tl_currentPhase = "_sendBlocksChangedPackets";
+    try {
+        origin();
+    } catch (...) {
+        logger().error("Exception in dim {} during _sendBlocksChangedPackets", tl_currentDimTypeId);
+        throw;
+    }
+}
+
+LL_TYPE_INSTANCE_HOOK(
+    DimensionProcessEntityTransfersHook,
+    ll::memory::HookPriority::Normal,
+    Dimension,
+    &Dimension::_processEntityChunkTransfers,
+    void
+) {
+    if (!config.enabled || !ParallelDimensionTickManager::isWorkerThread()) {
+        origin();
+        return;
+    }
+    tl_currentPhase = "_processEntityChunkTransfers";
+    try {
+        origin();
+    } catch (...) {
+        logger().error("Exception in dim {} during _processEntityChunkTransfers", tl_currentDimTypeId);
+        throw;
+    }
+}
+
+LL_TYPE_INSTANCE_HOOK(
+    DimensionTickEntityChunkMovesHook,
+    ll::memory::HookPriority::Normal,
+    Dimension,
+    &Dimension::_tickEntityChunkMoves,
+    void
+) {
+    if (!config.enabled || !ParallelDimensionTickManager::isWorkerThread()) {
+        origin();
+        return;
+    }
+    tl_currentPhase = "_tickEntityChunkMoves";
+    try {
+        origin();
+    } catch (...) {
+        logger().error("Exception in dim {} during _tickEntityChunkMoves", tl_currentDimTypeId);
+        throw;
+    }
+}
+
+LL_TYPE_INSTANCE_HOOK(
+    DimensionRunChunkGenWatchdogHook,
+    ll::memory::HookPriority::Normal,
+    Dimension,
+    &Dimension::_runChunkGenerationWatchdog,
+    void
+) {
+    if (!config.enabled || !ParallelDimensionTickManager::isWorkerThread()) {
+        origin();
+        return;
+    }
+    tl_currentPhase = "_runChunkGenerationWatchdog";
+    try {
+        origin();
+    } catch (...) {
+        logger().error("Exception in dim {} during _runChunkGenerationWatchdog", tl_currentDimTypeId);
+        throw;
+    }
+}
+
+// 主要 Hook
 
 LL_TYPE_INSTANCE_HOOK(
     DimensionTickHook,
@@ -278,7 +392,6 @@ LL_TYPE_INSTANCE_HOOK(
         origin(packet, except);
         return;
     }
-    // Phase 1: 直通，Phase 2 改为缓冲
     origin(packet, except);
 }
 
@@ -328,18 +441,13 @@ LL_TYPE_INSTANCE_HOOK(
         return;
     }
 
-    // 阶段 1: suppress dim.tick()
     g_collectedDimensions.clear();
     g_suppressDimensionTick.store(true, std::memory_order_release);
 
-    // 调用原始 Level::tick()
-    // tickEntities(), tickEntitySystems() 等正常执行
-    // forEachDimension 中的 dim.tick() 被 DimensionTickHook 拦截，只收集不执行
     origin();
 
     g_suppressDimensionTick.store(false, std::memory_order_release);
 
-    // 阶段 2: 并行 tick 收集到的维度
     if (!g_collectedDimensions.empty()) {
         g_inParallelPhase.store(true, std::memory_order_release);
         ParallelDimensionTickManager::getInstance().dispatchAndSync(this);
@@ -370,6 +478,11 @@ bool PluginImpl::enable() {
     if (!hookInstalled) {
         LevelTickHook::hook();
         DimensionTickHook::hook();
+        DimensionTickRedstoneHook::hook();
+        DimensionSendBlocksChangedHook::hook();
+        DimensionProcessEntityTransfersHook::hook();
+        DimensionTickEntityChunkMovesHook::hook();
+        DimensionRunChunkGenWatchdogHook::hook();
         DimensionSendBroadcastHook::hook();
         DimensionSendPacketForPositionHook::hook();
         DimensionSendPacketForEntityHook::hook();
@@ -385,6 +498,11 @@ bool PluginImpl::disable() {
     if (hookInstalled) {
         LevelTickHook::unhook();
         DimensionTickHook::unhook();
+        DimensionTickRedstoneHook::unhook();
+        DimensionSendBlocksChangedHook::unhook();
+        DimensionProcessEntityTransfersHook::unhook();
+        DimensionTickEntityChunkMovesHook::unhook();
+        DimensionRunChunkGenWatchdogHook::unhook();
         DimensionSendBroadcastHook::unhook();
         DimensionSendPacketForPositionHook::unhook();
         DimensionSendPacketForEntityHook::unhook();
