@@ -33,6 +33,10 @@ static std::atomic<bool> g_suppressDimensionTick{false};
 
 static std::vector<Dimension*> g_collectedDimensions;
 
+// 定义静态成员（在类外）
+std::unordered_set<std::string> ParallelDimensionTickManager::m_dangerousFunctions;
+std::mutex ParallelDimensionTickManager::m_dangerousMutex;
+
 Config& getConfig() { return config; }
 
 ll::io::Logger& logger() {
@@ -122,21 +126,19 @@ void ParallelDimensionTickManager::runOnMainThread(std::function<void()> task) {
     tl_currentContext->mainThreadTasks.enqueue(std::move(task));
 }
 
+// 修复后的危险函数标记
 void ParallelDimensionTickManager::markFunctionDangerous(const std::string& funcName) {
-    static std::unordered_set<std::string> g_dangerousFunctions;
-    static std::mutex g_dangerousMutex;
-    std::lock_guard lock(g_dangerousMutex);
-    if (g_dangerousFunctions.insert(funcName).second) {
+    std::lock_guard lock(m_dangerousMutex);
+    if (m_dangerousFunctions.insert(funcName).second) {
         logger().warn("Function '{}' marked as dangerous (will run on main thread from now on)", funcName);
         getInstance().mStats.totalDangerousFunctions++;
     }
 }
 
+// 修复后的危险函数检查
 bool ParallelDimensionTickManager::isFunctionDangerous(const std::string& funcName) {
-    static std::unordered_set<std::string> g_dangerousFunctions;
-    static std::mutex g_dangerousMutex;
-    std::lock_guard lock(g_dangerousMutex);
-    return g_dangerousFunctions.find(funcName) != g_dangerousFunctions.end();
+    std::lock_guard lock(m_dangerousMutex);
+    return m_dangerousFunctions.find(funcName) != m_dangerousFunctions.end();
 }
 
 void ParallelDimensionTickManager::workerLoop(DimensionWorkerContext* ctx) {
@@ -192,7 +194,6 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
         if (dim) {
             validDims.push_back(dim);
         } else {
-            // 修改点：将 logger().debug 改为条件判断 + info
             if (config.debug) {
                 logger().info("Skipping null dimension pointer during parallel tick");
             }
@@ -211,7 +212,6 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
         uint64_t currentTick = level->getTime();
         if (currentTick - mFallbackStartTick >= RECOVERY_INTERVAL_TICKS) {
             mStats.totalRecoveryAttempts++;
-            // 修改点：将 logger().debug 改为条件判断 + info
             if (config.debug) {
                 logger().info("Attempting recovery from fallback mode at tick {}", currentTick);
             }
