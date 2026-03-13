@@ -18,10 +18,6 @@
 #include <filesystem>
 #include <algorithm>
 
-#ifdef _WIN32
-#include <windows.h>
-#endif
-
 namespace dim_parallel {
 
 static Config                          config;
@@ -87,6 +83,7 @@ void ParallelDimensionTickManager::initialize() {
     if (mInitialized) return;
     mFallbackToSerial = false;
     mLastFallbackGameTime = 0;
+    mLastSuccessfulParallelTick = 0;
     
     mInitialized = true;
     
@@ -96,7 +93,7 @@ void ParallelDimensionTickManager::initialize() {
 }
 
 void ParallelDimensionTickManager::shutdown() {
-    if return;
+    if (!mInitialized) return;
     
     // 关闭所有维度线程
     for (auto& [id, ctx] : mContexts) {
@@ -112,8 +109,8 @@ void ParallelDimensionTickManager::shutdown() {
 
 bool ParallelDimensionTickManager::isWorkerThread() { return tl_isWorkerThread; }
 DimensionWorkerContext* ParallelDimensionTickManager::getCurrentContext() { return tl_currentContext; }
-DimensionType ParallelDimensionTickManager::getCurrentDimensionType() { 
-    return DimensionType(tl_currentDimTypeId); 
+int ParallelDimensionTickManager::getCurrentDimensionType() { 
+    return tl_currentDimTypeId; 
 }
 
 void ParallelDimensionTickManager::runOnMainThread(std::function<void()> task) {
@@ -124,13 +121,27 @@ void ParallelDimensionTickManager::runOnMainThread(std::function<void()> task) {
     tl_currentContext->mainThreadTasks.enqueue(std::move(task));
 }
 
+bool ParallelDimensionTickManager::shouldRecoverFromFallback() {
+    if (!mFallbackToSerial.load(std::memory_order_acquire)) {
+        return false;
+    }
+    
+    // 检查是否过了恢复延迟时间
+    int64_t currentTime = mSnapshot.time;
+    int64_t timeSinceFallback = currentTime - mLastFallbackGameTime.load(std::memory_order_relaxed);
+    
+    if (timeSinceFallback >= RECOVERY_DELAY) {
+        logger().info("Attempting to recover from fallback mode");
+        return true;
+    }
+    
+    return false;
+}
+
 void ParallelDimensionTickManager::dispatchAndSync(Level* level, std::vector<Dimension*>& dimensions) {
     if (!level || !mInitialized) {
         serialFallbackTick(dimensions);
-        return;
-    }
-
-    mSnapshot.time      = level->getTime();
+        return mSnapshot.time      = level->getTime();
     mSnapshot.simPaused = level->getSimPaused();
     
     if (config.debug) {
@@ -141,6 +152,19 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level, std::vector<Dim
     if (mSnapshot.simPaused) return;
 
     if (dimensions.empty()) return;
+
+    // 检查是否需要尝试恢复
+    if (mFallbackToSerial.load(std::memory_order_acquire) && shouldRecoverFromFallback()) {
+        // 尝试恢复到并行模式
+        mFallbackToSerial.store(false, std::memory_order_release);
+        mLastSuccessfulParallelTick.store(mSnapshot.time, std::memory_order_relaxed);
+    }
+
+    // 如果仍处于降级模式，执行串行回退
+    if (mFallbackToSerial.load(std::memory_order_acquire)) {
+        serialFallbackTick(dimensions);
+        return;
+    }
 
     // 准备维度上下文和线程
     for (auto* dim : dimensions) {
@@ -155,37 +179,58 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level, std::vector<Dim
         }
     }
 
-    // 创建并行任务 - 每个维度在自己的线程中执行
-    std::vector<std::future<void>> futures;
-    futures.reserve(dimensions.size());
-    
+    // 添加tick任务到各维度的专属线程
     for (auto* dim : dimensions) {
         int dimId = dim->getDimensionId();
         auto& ctx = mContexts[dimId];
         
-        auto future = std::async(std::launch::async, [this, &ctx]() {
-            tickDimensionAsync(*ctx);
+        // 添加tick任务到该维度的专属线程
+        ctx->addTickTask([this, &ctx]() {
+            tickDimensionAsync(ctx);
         });
-        futures.push_back(std::move(future));
     }
 
     if (config.debug) {
-        logger().info("Executing {} dimension tasks asynchronously", dimensions.size());
+        logger().info("Added tick tasks to {} dimension threads", dimensions.size());
     }
 
-    // 等待所有任务完成
-    for (auto& future : futures) {
-        future.wait();
+    // 在等待维度线程完成的过程中，同时处理主线程任务
+    // 这样可以避免死锁：主线程在等待时也能处理来自工作线程的主线程任务
+    bool allCompleted = false;
+    while (!allCompleted) {
+        allCompleted = true;
+        
+        // 检查每个维度的完成状态
+        for (auto* dim : dimensions) {
+            int dimId = dim->getDimensionId();
+            auto& ctx = mContexts[dimId];
+            
+            // 尝试处理主线程任务（非阻塞）
+            {
+                std::lock_guard lock(ctx.queueMutex);
+                if (ctx.hasPendingWork.load(std::memory_order_acquire) || 
+                    ctx.isWorking.load(std::memory_order_acquire)) {
+                    allCompleted = false;
+                }
+            }
+        }
+        
+        // 处理主线程任务（如果有）
+        if (!allCompleted) {
+            processAllMainThreadTasks();
+            std::this_thread::sleep_for(std::chrono::microseconds(10)); // 避免CPU空转
+        }
     }
     
     if (config.debug) {
         logger().info("All dimension tasks completed");
     }
 
-    // 处理主线程任务
+    // 最后处理剩余的主线程任务
     processAllMainThreadTasks();
 
     mStats.totalParallelTicks++;
+    mLastSuccessfulParallelTick.store(mSnapshot.time, std::memory_order_relaxed);
 
     if (config.debug && (mStats.totalParallelTicks % 50 == 0)) {
         logger().info(
@@ -248,11 +293,13 @@ void ParallelDimensionTickManager::tickDimensionAsync(DimensionWorkerContext& ct
 void ParallelDimensionTickManager::processAllMainThreadTasks() {
     for (auto& [dimId, ctx] : mContexts) {
         size_t count = ctx->mainThreadTasks.size();
-        if (count > 0 && config.debug) {
-            logger().info("Processing {} main thread tasks for dimension {}", count, dimId);
+        if (count > 0) {
+            if (config.debug) {
+                logger().info("Processing {} main thread tasks for dimension {}", count, dimId);
+            }
+            ctx->mainThreadTasks.processAll();
+            mStats.totalMainThreadTasks += count;
         }
-        ctx->mainThreadTasks.processAll();
-        mStats.totalMainThreadTasks += count;
     }
 }
 
@@ -357,7 +404,7 @@ LL_TYPE_INSTANCE_HOOK(
     DimensionTickHook,
     ll::memory::HookPriority::Normal,
     Dimension,
-    &Dimension::tick,
+    &Dimension::$tick,
     void
 ) {
     if (!config.enabled) {
@@ -386,7 +433,7 @@ LL_TYPE_INSTANCE_HOOK(
     LevelTickHook,
     ll::memory::HookPriority::Normal,
     Level,
-    &Level::tick,
+    &Level::$tick,
     void
 ) {
     if (!config.enabled) {
