@@ -52,7 +52,6 @@ class WorkerPool {
 public:
     void start(int numWorkers);
     void stop();
-    // 修改：主线程只等待，不执行任务
     void executeAll(std::vector<std::function<void()>>& tasks);
     int  workerCount() const { return static_cast<int>(mHandles.size()); }
 
@@ -80,11 +79,10 @@ public:
     static ParallelDimensionTickManager& getInstance();
     void initialize();
     void shutdown();
-    void dispatchAndSync(class Level* level, std::vector<Dimension*>& collectedDims); // 接收维度列表
+    void dispatchAndSync(class Level* level, std::vector<Dimension*>& collectedDims);
 
     static bool                    isWorkerThread();
     static DimensionWorkerContext* getCurrentContext();
-    // 改为返回 int，避免头文件依赖 DimensionType（问题 8）
     static int                     getCurrentDimensionId();
     static void                    runOnMainThread(std::function<void()> task);
 
@@ -96,7 +94,7 @@ public:
         std::atomic<uint64_t> totalMainThreadTasks{0};
         std::atomic<uint64_t> maxDimTickTimeUs{0};
         std::atomic<int>      consecutiveFailures{0};
-        std::atomic<int64_t>  lastFailureTimeMs{0}; // Unix ms
+        std::atomic<int64_t>  lastFailureTimeMs{0};
     };
     Stats& getStats() { return mStats; }
 
@@ -109,7 +107,6 @@ private:
     void recordFailure();
     void tryRecoverFromFallback();
 
-    // 不再全局共享，dispatch 时构建快照
     std::vector<DimensionWorkerContext*> mContextSnapshot;
     std::unordered_map<int, DimensionWorkerContext> mContexts;
     LevelTickSnapshot                               mSnapshot;
