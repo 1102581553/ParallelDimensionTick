@@ -56,24 +56,18 @@ bool saveConfig() {
 }
 
 void MainThreadTaskQueue::enqueue(std::function<void()> task) {
-    std::lock_guard lock(mMutex);
-    mTasks.push_back(std::move(task));
+    mQueue.enqueue(std::move(task));
 }
 
 void MainThreadTaskQueue::processAll() {
-    {
-        std::lock_guard lock(mMutex);
-        mProcessing.swap(mTasks);
-    }
-    for (auto& task : mProcessing) {
+    std::function<void()> task;
+    while (mQueue.dequeue(task)) {
         task();
     }
-    mProcessing.clear();
 }
 
 size_t MainThreadTaskQueue::size() const {
-    std::lock_guard lock(mMutex);
-    return mTasks.size();
+    return mQueue.size();
 }
 
 //=============================================================================
@@ -90,18 +84,15 @@ void ParallelDimensionTickManager::initialize() {
     mFallbackToSerial = false;
     mFallbackStartTick = 0;
     mInitialized = true;
-    logger().info("Initialized independent per-dimension thread model");
+    logger().info("Initialized lock-free per-dimension thread model");
 }
 
 void ParallelDimensionTickManager::shutdown() {
     if (!mInitialized) return;
     for (auto& [id, ctx] : mContexts) {
         if (ctx->workerThread.joinable()) {
-            {
-                std::lock_guard lock(ctx->wakeMutex);
-                ctx->shutdown = true;
-                ctx->shouldWork = false;
-            }
+            ctx->shutdown.store(true, std::memory_order_release);
+            ctx->shouldWork.store(false, std::memory_order_release);
             ctx->wakeCV.notify_one();
             ctx->workerThread.join();
         }
@@ -149,9 +140,14 @@ void ParallelDimensionTickManager::workerLoop(DimensionWorkerContext* ctx) {
 
     while (true) {
         std::unique_lock lock(ctx->wakeMutex);
-        ctx->wakeCV.wait(lock, [ctx] { return ctx->shouldWork || ctx->shutdown; });
-        if (ctx->shutdown) break;
-        ctx->shouldWork = false;
+        ctx->wakeCV.wait(lock, [ctx] { 
+            return ctx->shouldWork.load(std::memory_order_acquire) || 
+                   ctx->shutdown.load(std::memory_order_acquire); 
+        });
+        
+        if (ctx->shutdown.load(std::memory_order_acquire)) break;
+        
+        ctx->shouldWork.store(false, std::memory_order_release);
         lock.unlock();
 
         if (ctx->dimensionPtr) {
@@ -228,13 +224,13 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
         if (it == mContexts.end()) {
             auto ctx = std::make_unique<DimensionWorkerContext>();
             ctx->dimensionPtr = dim;
-            ctx->tickCompleted = false;
-            ctx->isProcessing = false;
-            ctx->shutdown = false;
-            ctx->shouldWork = false;
-            ctx->tickNumber = 0;
-            ctx->skippedTicks = 0;
-            ctx->totalSkippedTicks = 0;
+            ctx->tickCompleted.store(false, std::memory_order_relaxed);
+            ctx->isProcessing.store(false, std::memory_order_relaxed);
+            ctx->shutdown.store(false, std::memory_order_relaxed);
+            ctx->shouldWork.store(false, std::memory_order_relaxed);
+            ctx->tickNumber.store(0, std::memory_order_relaxed);
+            ctx->skippedTicks.store(0, std::memory_order_relaxed);
+            ctx->totalSkippedTicks.store(0, std::memory_order_relaxed);
             ctx->workerThread = std::thread(&ParallelDimensionTickManager::workerLoop, this, ctx.get());
             mContexts[dimId] = std::move(ctx);
         } else {
@@ -247,35 +243,30 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
         int dimId = dim->getDimensionId();
         auto& ctx = *mContexts[dimId];
         
-        // 如果上一个 tick 还没完成，跳过本次（维度独立运行）
+        // 如果上一个 tick 还没完成，跳过本次
         if (ctx.isProcessing.load(std::memory_order_acquire)) {
-            ctx.skippedTicks++;
-            ctx.totalSkippedTicks++;
-            mStats.totalTicksSkippedDueToBacklog++;
+            uint64_t skipped = ctx.skippedTicks.fetch_add(1, std::memory_order_relaxed) + 1;
+            ctx.totalSkippedTicks.fetch_add(1, std::memory_order_relaxed);
+            mStats.totalTicksSkippedDueToBacklog.fetch_add(1, std::memory_order_relaxed);
             
-            if (config.debug && ctx.skippedTicks % 20 == 0) {
+            if (config.debug && skipped % 20 == 0) {
                 logger().warn("Dimension {} has skipped {} ticks (total: {})", 
-                    dimId, ctx.skippedTicks, ctx.totalSkippedTicks);
+                    dimId, skipped, ctx.totalSkippedTicks.load(std::memory_order_relaxed));
             }
             continue;
         }
 
         // 重置连续跳过计数
-        if (ctx.skippedTicks > 0) {
-            if (config.debug) {
-                logger().info("Dimension {} recovered after {} skipped ticks", dimId, ctx.skippedTicks);
-            }
-            ctx.skippedTicks = 0;
+        uint64_t prevSkipped = ctx.skippedTicks.exchange(0, std::memory_order_relaxed);
+        if (prevSkipped > 0 && config.debug) {
+            logger().info("Dimension {} recovered after {} skipped ticks", dimId, prevSkipped);
         }
 
         ctx.tickCompleted.store(false, std::memory_order_release);
         ctx.isProcessing.store(true, std::memory_order_release);
-        ctx.tickNumber++;
+        ctx.tickNumber.fetch_add(1, std::memory_order_relaxed);
         
-        {
-            std::lock_guard lock(ctx.wakeMutex);
-            ctx.shouldWork = true;
-        }
+        ctx.shouldWork.store(true, std::memory_order_release);
         ctx.wakeCV.notify_one();
     }
 
@@ -296,34 +287,36 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
     }
 
     if (totalTasksThisCycle > 0) {
-        mStats.totalMainThreadTasks += totalTasksThisCycle;
-        mStats.cycleMainThreadTasks += totalTasksThisCycle;
+        mStats.totalMainThreadTasks.fetch_add(totalTasksThisCycle, std::memory_order_relaxed);
+        mStats.cycleMainThreadTasks.fetch_add(totalTasksThisCycle, std::memory_order_relaxed);
     }
 
     if (mFallbackToSerial.load(std::memory_order_relaxed)) {
         mFallbackStartTick = level->getTime();
     }
 
-    mStats.totalParallelTicks++;
+    mStats.totalParallelTicks.fetch_add(1, std::memory_order_relaxed);
 
-    if (config.debug && (mStats.totalParallelTicks % 200 == 0)) {
-        uint64_t cycleTasks = mStats.cycleMainThreadTasks.exchange(0);
+    if (config.debug && (mStats.totalParallelTicks.load(std::memory_order_relaxed) % 200 == 0)) {
+        uint64_t cycleTasks = mStats.cycleMainThreadTasks.exchange(0, std::memory_order_relaxed);
         logger().info(
             "Parallel tick #{}: dims={} mainTasks={} skippedTicksTotal={} fallbacks={} dangerous={} recoveryAttempts={} skipped={}",
-            mStats.totalParallelTicks.load(),
+            mStats.totalParallelTicks.load(std::memory_order_relaxed),
             validDims.size(),
             cycleTasks,
-            mStats.totalTicksSkippedDueToBacklog.load(),
-            mStats.totalFallbackTicks.load(),
-            mStats.totalDangerousFunctions.load(),
-            mStats.totalRecoveryAttempts.load(),
-            mStats.totalSkippedDimensions.load()
+            mStats.totalTicksSkippedDueToBacklog.load(std::memory_order_relaxed),
+            mStats.totalFallbackTicks.load(std::memory_order_relaxed),
+            mStats.totalDangerousFunctions.load(std::memory_order_relaxed),
+            mStats.totalRecoveryAttempts.load(std::memory_order_relaxed),
+            mStats.totalSkippedDimensions.load(std::memory_order_relaxed)
         );
         for (auto* dim : validDims) {
             int dimId = dim->getDimensionId();
             auto& ctx = *mContexts[dimId];
             logger().info(" dim[{}]: {}us (tick #{}, skipped: {})", 
-                dimId, ctx.lastTickTimeUs, ctx.tickNumber, ctx.totalSkippedTicks);
+                dimId, ctx.lastTickTimeUs, 
+                ctx.tickNumber.load(std::memory_order_relaxed), 
+                ctx.totalSkippedTicks.load(std::memory_order_relaxed));
         }
     }
 }
@@ -367,7 +360,8 @@ void ParallelDimensionTickManager::tickDimensionOnWorker(DimensionWorkerContext&
 
     uint64_t expected = mStats.maxDimTickTimeUs.load(std::memory_order_relaxed);
     while (ctx.lastTickTimeUs > expected) {
-        if (mStats.maxDimTickTimeUs.compare_exchange_weak(expected, ctx.lastTickTimeUs)) break;
+        if (mStats.maxDimTickTimeUs.compare_exchange_weak(expected, ctx.lastTickTimeUs, 
+            std::memory_order_relaxed, std::memory_order_relaxed)) break;
     }
 
     tl_currentPhase = "idle";
@@ -377,7 +371,7 @@ void ParallelDimensionTickManager::serialFallbackTick(const std::vector<Dimensio
     for (auto* dim : dimRefs) {
         if (dim) dim->tick();
     }
-    mStats.totalFallbackTicks++;
+    mStats.totalFallbackTicks.fetch_add(1, std::memory_order_relaxed);
 }
 
 //=============================================================================
