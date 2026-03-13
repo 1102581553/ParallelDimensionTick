@@ -40,9 +40,6 @@ static std::mutex              g_collectMutex;
 static std::unordered_set<std::string> g_dangerousFunctions;
 static std::mutex                       g_dangerousMutex;
 
-// Definition of static member
-MainThreadTaskQueue ParallelDimensionTickManager::mMainThreadTasks;
-
 Config& getConfig() { return config; }
 
 ll::io::Logger& logger() {
@@ -84,7 +81,7 @@ size_t MainThreadTaskQueue::size() const {
 }
 
 //=============================================================================
-// ParallelDimensionTickManager implementation with per-dimension threads
+// ParallelDimensionTickManager implementation
 //=============================================================================
 
 ParallelDimensionTickManager& ParallelDimensionTickManager::getInstance() {
@@ -103,7 +100,6 @@ void ParallelDimensionTickManager::initialize() {
 void ParallelDimensionTickManager::shutdown() {
     if (!mInitialized) return;
 
-    // Signal all worker threads to shut down and wait for them
     for (auto& [id, ctx] : mContexts) {
         if (ctx->workerThread.joinable()) {
             {
@@ -129,7 +125,8 @@ void ParallelDimensionTickManager::runOnMainThread(std::function<void()> task) {
         task();
         return;
     }
-    mMainThreadTasks.enqueue(std::move(task));
+    // Push to current dimension's own task queue
+    tl_currentContext->mainThreadTasks.enqueue(std::move(task));
 }
 
 void ParallelDimensionTickManager::markFunctionDangerous(const std::string& funcName) {
@@ -157,10 +154,7 @@ void ParallelDimensionTickManager::workerLoop(DimensionWorkerContext* ctx) {
         ctx->shouldWork = false;
         lock.unlock();
 
-        // Perform the dimension tick
         tickDimensionOnWorker(*ctx);
-
-        // Mark completion
         ctx->tickCompleted = true;
     }
 
@@ -187,17 +181,15 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
     auto& dimensions = g_collectedDimensions;
     if (dimensions.empty()) return;
 
-    // If only one dimension, just tick it directly (no parallelism overhead)
     if (dimensions.size() == 1) {
         dimensions[0]->tick();
         return;
     }
 
-    // Check if we are in fallback mode and attempt recovery if interval elapsed
+    // Check recovery
     if (mFallbackToSerial.load(std::memory_order_relaxed)) {
         uint64_t currentTick = level->getTime();
         if (currentTick - mFallbackStartTick >= RECOVERY_INTERVAL_TICKS) {
-            // Attempt recovery
             mStats.totalRecoveryAttempts++;
             logger().debug("Attempting recovery from fallback mode at tick {}", currentTick);
             mFallbackToSerial.store(false, std::memory_order_relaxed);
@@ -238,12 +230,19 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
         ctx->wakeCV.notify_one();
     }
 
-    // Wait for all dimensions to complete their tick
+    // Wait for all dimensions to complete, processing tasks as they finish
     while (pendingCount.load(std::memory_order_relaxed) > 0) {
         for (auto* dim : dimensions) {
             int dimId = dim->getDimensionId();
             auto& ctx = mContexts[dimId];
             if (ctx->tickCompleted.load(std::memory_order_acquire)) {
+                // Process this dimension's pending tasks immediately
+                size_t taskCount = ctx->mainThreadTasks.size();
+                if (taskCount > 0) {
+                    ctx->mainThreadTasks.processAll();
+                    mStats.totalMainThreadTasks += taskCount;
+                }
+                // Mark completion for this dimension
                 bool expected = true;
                 if (ctx->tickCompleted.compare_exchange_strong(expected, false)) {
                     pendingCount.fetch_sub(1, std::memory_order_relaxed);
@@ -255,10 +254,7 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
         }
     }
 
-    // Process all main thread tasks that were queued during parallel tick
-    processAllMainThreadTasks();
-
-    // If any dimension tick triggered fallback flag, we switch to serial mode and record start tick
+    // If any dimension triggered fallback, record start tick
     if (mFallbackToSerial.load(std::memory_order_relaxed)) {
         mFallbackStartTick = level->getTime();
     }
@@ -323,12 +319,6 @@ void ParallelDimensionTickManager::tickDimensionOnWorker(DimensionWorkerContext&
     tl_currentPhase     = "idle";
 }
 
-void ParallelDimensionTickManager::processAllMainThreadTasks() {
-    size_t count = mMainThreadTasks.size();
-    mMainThreadTasks.processAll();
-    mStats.totalMainThreadTasks += static_cast<uint64_t>(count);
-}
-
 void ParallelDimensionTickManager::serialFallbackTick(std::vector<Dimension*>& dimensions) {
     for (auto* dim : dimensions) {
         dim->tick();
@@ -348,7 +338,6 @@ inline void handleDangerousFunction(const char* funcName, Func&& func, Args&&...
     }
     if (ParallelDimensionTickManager::isWorkerThread()) {
         if (ParallelDimensionTickManager::isFunctionDangerous(funcName)) {
-            // Forward to main thread
             auto bound = std::bind(std::forward<Func>(func), std::forward<Args>(args)...);
             ParallelDimensionTickManager::runOnMainThread([bound = std::move(bound)]() mutable {
                 bound();
@@ -360,7 +349,7 @@ inline void handleDangerousFunction(const char* funcName, Func&& func, Args&&...
 }
 
 //=============================================================================
-// Hooks (all sub-functions now use handleDangerousFunction)
+// Hooks (all sub-functions use handleDangerousFunction)
 //=============================================================================
 
 LL_TYPE_INSTANCE_HOOK(
