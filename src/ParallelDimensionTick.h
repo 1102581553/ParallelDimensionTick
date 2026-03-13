@@ -9,8 +9,8 @@
 #include <mc/network/Packet.h>
 
 #include <atomic>
+#include <condition_variable>
 #include <functional>
-#include <latch>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -18,8 +18,6 @@
 #include <vector>
 
 namespace dim_parallel {
-
-// ==================== 配置 ====================
 
 struct Config {
     int  version = 1;
@@ -31,8 +29,6 @@ Config&         getConfig();
 bool            loadConfig();
 bool            saveConfig();
 ll::io::Logger& logger();
-
-// ==================== 线程安全任务队列 ====================
 
 class MainThreadTaskQueue {
 public:
@@ -46,15 +42,10 @@ private:
     std::vector<std::function<void()>> mProcessing;
 };
 
-// ==================== Level 状态快照 ====================
-
 struct LevelTickSnapshot {
-    int      time        = 0;
-    uint64_t currentTick = 0;
-    bool     simPaused   = false;
+    int  time      = 0;
+    bool simPaused = false;
 };
-
-// ==================== 维度工作线程上下文 ====================
 
 struct DimensionWorkerContext {
     Dimension*          dimension = nullptr;
@@ -62,7 +53,25 @@ struct DimensionWorkerContext {
     uint64_t            lastTickTimeUs = 0;
 };
 
-// ==================== 并行调度管理器 ====================
+class WorkerPool {
+public:
+    void start(int numWorkers);
+    void stop();
+    void submitAndWait(std::vector<std::function<void()>>& tasks);
+    int  workerCount() const { return static_cast<int>(mWorkers.size()); }
+
+private:
+    void workerLoop();
+
+    std::vector<std::thread>            mWorkers;
+    std::mutex                          mMutex;
+    std::condition_variable             mWorkerCV;
+    std::condition_variable             mDoneCV;
+    std::vector<std::function<void()>>* mCurrentTasks = nullptr;
+    std::atomic<int>                    mTaskIndex{0};
+    std::atomic<int>                    mTasksRemaining{0};
+    bool                                mShutdown = false;
+};
 
 class ParallelDimensionTickManager {
 public:
@@ -70,7 +79,6 @@ public:
 
     void initialize();
     void shutdown();
-
     void dispatchAndSync(class Level* level);
 
     static bool                    isWorkerThread();
@@ -95,22 +103,17 @@ private:
 
     std::unordered_map<int, DimensionWorkerContext> mContexts;
     LevelTickSnapshot                               mSnapshot;
+    WorkerPool                                      mPool;
     std::atomic<bool>                               mFallbackToSerial{false};
-    std::atomic<bool>                               mShutdownRequested{false};
     bool                                            mInitialized = false;
     Stats                                           mStats;
 };
 
-// ==================== 插件主类 ====================
-
 class PluginImpl {
 public:
     static PluginImpl& getInstance();
-
     PluginImpl() : mSelf(*ll::mod::NativeMod::current()) {}
-
     [[nodiscard]] ll::mod::NativeMod& getSelf() const { return mSelf; }
-
     bool load();
     bool enable();
     bool disable();
