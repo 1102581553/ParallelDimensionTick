@@ -23,8 +23,8 @@ struct Config {
     int  version            = 1;
     bool enabled            = true;
     bool debug              = false;
-    bool parallelActorTick  = true;  // 并行 Actor::tick
-    bool parallelChunkTick  = true;  // 并行 LevelChunk tick
+    bool parallelActorTick  = true;
+    bool parallelChunkTick  = true;
 };
 
 Config&         getConfig();
@@ -103,7 +103,7 @@ public:
         std::atomic<uint64_t> actorTicksSuppressed{0};
         std::atomic<uint64_t> actorTicksParallel{0};
     };
-    Stats const& getStats() const { return mStats; }
+    Stats& getStats() { return mStats; }
 
 private:
     ParallelDimensionTickManager() = default;
