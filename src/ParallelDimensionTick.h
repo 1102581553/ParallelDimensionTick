@@ -79,7 +79,7 @@ public:
         std::atomic<uint64_t> totalFallbackTicks{0};
         std::atomic<uint64_t> totalMainThreadTasks{0};
         std::atomic<uint64_t> maxDimTickTimeUs{0};
-        std::atomic<uint64_t> totalRecoveryAttempts{0};  // New statistic
+        std::atomic<uint64_t> totalRecoveryAttempts{0};
     };
     Stats& getStats() { return mStats; }
 
@@ -98,8 +98,8 @@ private:
     bool                                             mInitialized = false;
     Stats                                            mStats;
 
-    // Global main thread task queue (merged)
-    MainThreadTaskQueue                              mMainThreadTasks;
+    // Global main thread task queue (merged) - now static to allow access from static methods
+    static MainThreadTaskQueue                       mMainThreadTasks;
 
     // Recovery mechanism
     static constexpr uint64_t                        RECOVERY_INTERVAL_TICKS = 20; // 1 second at 20 tps
