@@ -426,14 +426,13 @@ LL_TYPE_INSTANCE_HOOK(
         origin();
         return;
     }
-    tl_currentPhase = "_runChunkGenerationWatchdog";
-    try {
-        origin();
-    } catch (...) {
-        logger().error("Exception in dim {} during _runChunkGenerationWatchdog", tl_currentDimTypeId);
-        throw;
-    }
+    // 延迟到主线程执行，避免并发访问 ChunkGenerationManager
+    Dimension* self = this;
+    ParallelDimensionTickManager::runOnMainThread([self]() {
+        self->_runChunkGenerationWatchdog();
+    });
 }
+
 
 LL_TYPE_INSTANCE_HOOK(
     DimensionTickHook,
