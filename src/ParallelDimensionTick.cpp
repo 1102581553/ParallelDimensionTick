@@ -35,7 +35,7 @@ static std::atomic<bool>       g_suppressDimensionTick{false};
 static std::vector<Dimension*> g_collectedDimensions;
 static std::mutex              g_collectMutex;
 
-// 区块并行控制
+// 区块并行控制 — 全局收集，所有维度的区块 tick 统一收集后并行
 struct DeferredChunkTick {
     LevelChunk*           chunk;
     BlockSource*          region;
@@ -220,7 +220,7 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
     auto& dimensions = g_collectedDimensions;
     if (dimensions.empty()) return;
 
-    if (dimensions.size() == 1) {
+    if (dimensions.size() == 1 && !config.parallelChunkTick) {
         dimensions[0]->tick();
         return;
     }
@@ -231,15 +231,51 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
         ctx.dimension = dim;
     }
 
-    std::vector<std::function<void()>> tasks;
-    tasks.reserve(dimensions.size());
+    // 阶段 1: 启用区块收集，并行执行维度 tick（区块 tick 被收集不执行）
+    if (config.parallelChunkTick) {
+        g_collectedChunkTicks.clear();
+        g_suppressChunkTick.store(true, std::memory_order_release);
+    }
+
+    // 并行维度 tick
+    std::vector<std::function<void()>> dimTasks;
+    dimTasks.reserve(dimensions.size());
     for (auto* dim : dimensions) {
         int   dimId = dim->getDimensionId();
         auto& ctx   = mContexts[dimId];
-        tasks.emplace_back([this, &ctx]() { tickDimensionOnWorker(ctx); });
+        dimTasks.emplace_back([this, &ctx]() { tickDimensionOnWorker(ctx); });
+    }
+    mPool.executeAll(dimTasks);
+
+    // 阶段 2: 关闭区块收集
+    if (config.parallelChunkTick) {
+        g_suppressChunkTick.store(false, std::memory_order_release);
     }
 
-    mPool.executeAll(tasks);
+    // 阶段 3: 并行执行所有收集到的区块 tick（跨所有维度）
+    if (config.parallelChunkTick && !g_collectedChunkTicks.empty()) {
+        std::vector<std::function<void()>> chunkTasks;
+        chunkTasks.reserve(g_collectedChunkTicks.size());
+
+        for (auto& ct : g_collectedChunkTicks) {
+            chunkTasks.emplace_back([&ct]() {
+                try {
+                    ct.chunk->tickImpl(*ct.region, ct.tick, ct.spawnerCallback);
+                } catch (...) {
+                    // 单个区块崩溃不影响其他
+                }
+            });
+        }
+
+        g_inChunkParallelPhase.store(true, std::memory_order_release);
+        mPool.executeAll(chunkTasks);
+        g_inChunkParallelPhase.store(false, std::memory_order_release);
+
+        mStats.chunkBatchCount++;
+        mStats.chunksTickedParallel += g_collectedChunkTicks.size();
+    }
+
+    // 阶段 4: 处理主线程任务
     processAllMainThreadTasks();
 
     mStats.totalParallelTicks++;
@@ -316,7 +352,6 @@ using namespace dim_parallel;
 
 // ==================== 区块并行 tick ====================
 
-// Hook LevelChunk::tickImpl — suppress 模式下收集，parallel 模式下正常执行
 LL_TYPE_INSTANCE_HOOK(
     LevelChunkTickImplHook,
     ll::memory::HookPriority::Normal,
@@ -333,14 +368,12 @@ LL_TYPE_INSTANCE_HOOK(
     }
 
     if (g_suppressChunkTick.load(std::memory_order_acquire)) {
-        // 收集阶段
         std::lock_guard lock(g_chunkCollectMutex);
         g_collectedChunkTicks.push_back({this, &tickRegion, tick, std::move(spawnerCallback)});
         return;
     }
 
     if (g_inChunkParallelPhase.load(std::memory_order_acquire)) {
-        // 并行执行阶段
         origin(tickRegion, tick, spawnerCallback);
         return;
     }
@@ -443,8 +476,6 @@ LL_TYPE_INSTANCE_HOOK(
     });
 }
 
-// Dimension::tick hook — suppress 模式下收集维度指针
-// 同时在 tick 内部启用区块收集+并行
 LL_TYPE_INSTANCE_HOOK(
     DimensionTickHook,
     ll::memory::HookPriority::Normal,
@@ -456,48 +487,15 @@ LL_TYPE_INSTANCE_HOOK(
         origin();
         return;
     }
-
     if (g_suppressDimensionTick.load(std::memory_order_acquire)) {
         std::lock_guard lock(g_collectMutex);
         g_collectedDimensions.push_back(this);
         return;
     }
-
-    if (g_inParallelPhase.load(std::memory_order_acquire) && config.parallelChunkTick) {
-        // 在维度 tick 内部，启用区块收集
-        g_collectedChunkTicks.clear();
-        g_suppressChunkTick.store(true, std::memory_order_release);
-
-        // 执行原始 Dimension::tick()
-        // 内部的 LevelChunk::tickImpl 调用会被收集而不执行
+    if (g_inParallelPhase.load(std::memory_order_acquire)) {
         origin();
-
-        g_suppressChunkTick.store(false, std::memory_order_release);
-
-        // 并行执行收集到的区块 ticks
-        if (!g_collectedChunkTicks.empty()) {
-            auto& stats = ParallelDimensionTickManager::getInstance().getStats();
-            stats.chunkBatchCount++;
-
-            std::vector<std::function<void()>> chunkTasks;
-            chunkTasks.reserve(g_collectedChunkTicks.size());
-
-            for (auto& ct : g_collectedChunkTicks) {
-                chunkTasks.emplace_back([&ct]() {
-                    ct.chunk->tickImpl(*ct.region, ct.tick, ct.spawnerCallback);
-                });
-            }
-
-            g_inChunkParallelPhase.store(true, std::memory_order_release);
-            ParallelDimensionTickManager::getInstance().getWorkerPool().executeAll(chunkTasks);
-            g_inChunkParallelPhase.store(false, std::memory_order_release);
-
-            stats.chunksTickedParallel += g_collectedChunkTicks.size();
-        }
-
         return;
     }
-
     origin();
 }
 
