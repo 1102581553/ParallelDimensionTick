@@ -18,6 +18,10 @@
 #include <filesystem>
 #include <algorithm>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 namespace dim_parallel {
 
 static Config                          config;
@@ -74,112 +78,6 @@ size_t MainThreadTaskQueue::size() const {
     return mTasks.size();
 }
 
-void WorkerPool::start(int numWorkers) {
-    std::lock_guard lock(mMutex);
-    if (!mThreads.empty()) return;
-    
-    mShutdown = false;
-    mGeneration = 0;
-    mBatch.tasks = nullptr;
-    mBatch.nextIdx.store(0, std::memory_order_relaxed);
-    mBatch.doneCount.store(0, std::memory_order_relaxed);
-    mBatch.completed.store(false, std::memory_order_relaxed);
-    
-    for (int i = 0; i < numWorkers; ++i) {
-        mThreads.emplace_back([this, i]() {
-            #ifdef _WIN32
-                wchar_t name[32];
-                swprintf(name, L"DimParallelWorker-%d", i);
-                SetThreadDescription(GetCurrentThread(), name);
-            #endif
-            workerLoop();
-        });
-    }
-    
-    if (config.debug) {
-        logger().info("Worker pool started with {} threads", numWorkers);
-    }
-}
-
-void WorkerPool::stop() {
-    {
-        std::lock_guard lock(mMutex);
-        mShutdown = true;
-        ++mGeneration;
-    }
-    mWakeCV.notify_all();
-    
-    for (auto& thread : mThreads) {
-        if (thread.joinable()) {
-            thread.join();
-        }
-    }
-    mThreads.clear();
-    
-    if (config.debug) {
-        logger().info("Worker pool stopped");
-    }
-}
-
-void WorkerPool::executeAll(std::vector<std::function<void()>>& tasks) {
-    if (tasks.empty()) return;
-    
-    {
-        std::lock_guard lock(mMutex);
-        mBatch.tasks = &tasks;
-        mBatch.nextIdx = 0;
-        mBatch.doneCount = 0;
-        mBatch.completed = false;
-        ++mGeneration;
-    }
-    mWakeCV.notify_all();
-    
-    // Main thread also participates in work (work stealing)
-    while (true) {
-        int idx = mBatch.nextIdx.fetch_add(1, std::memory_order_relaxed);
-        if (idx >= static_cast<int>(tasks.size())) break;
-        tasks[idx]();
-        mBatch.doneCount.fetch_add(1, std::memory_order_release);
-    }
-    
-    // Wait for other threads to complete
-    while (mBatch.doneCount.load(std::memory_order_acquire) < static_cast<int>(tasks.size())) {
-        std::this_thread::yield();
-    }
-    
-    {
-        std::lock_guard lock(mMutex);
-        mBatch.tasks = nullptr;
-        mBatch.completed = true;
-    }
-}
-
-void WorkerPool::workerLoop() {
-    uint64_t localGen = 0;
-    
-    while (true) {
-        std::unique_lock lock(mMutex);
-        mWakeCV.wait(lock, [this, &localGen]() {
-            return mShutdown.load(std::memory_order_acquire) || 
-                   mGeneration.load(std::memory_order_acquire) > localGen;
-        });
-        
-        if (mShutdown.load(std::memory_order_acquire)) break;
-        localGen = mGeneration.load(std::memory_order_acquire);
-        lock.unlock();
-        
-        // Execute tasks
-        if (mBatch.tasks) {
-            while (true) {
-                int idx = mBatch.nextIdx.fetch_add(1, std::memory_order_relaxed);
-                if (idx >= static_cast<int>(mBatch.tasks->size())) break;
-                (*mBatch.tasks)[idx]();
-                mBatch.doneCount.fetch_add(1, std::memory_order_release);
-            }
-        }
-    }
-}
-
 ParallelDimensionTickManager& ParallelDimensionTickManager::getInstance() {
     static ParallelDimensionTickManager instance;
     return instance;
@@ -190,19 +88,20 @@ void ParallelDimensionTickManager::initialize() {
     mFallbackToSerial = false;
     mLastFallbackGameTime = 0;
     
-    int hwThreads  = static_cast<int>(std::thread::hardware_concurrency());
-    int numWorkers = std::max(1, hwThreads - 1);
-    mPool.start(numWorkers);
     mInitialized = true;
     
     if (config.debug) {
-        logger().info("ParallelDimensionTickManager initialized: {} hw threads, {} workers", hwThreads, numWorkers);
+        logger().info("ParallelDimensionTickManager initialized with complete isolation");
     }
 }
 
 void ParallelDimensionTickManager::shutdown() {
-    if (!mInitialized) return;
-    mPool.stop();
+    if return;
+    
+    // 关闭所有维度线程
+    for (auto& [id, ctx] : mContexts) {
+        ctx->shutdown();
+    }
     mContexts.clear();
     mInitialized = false;
     
@@ -213,7 +112,9 @@ void ParallelDimensionTickManager::shutdown() {
 
 bool ParallelDimensionTickManager::isWorkerThread() { return tl_isWorkerThread; }
 DimensionWorkerContext* ParallelDimensionTickManager::getCurrentContext() { return tl_currentContext; }
-DimensionType ParallelDimensionTickManager::getCurrentDimensionType() { return DimensionType(tl_currentDimTypeId); }
+DimensionType ParallelDimensionTickManager::getCurrentDimensionType() { 
+    return DimensionType(tl_currentDimTypeId); 
+}
 
 void ParallelDimensionTickManager::runOnMainThread(std::function<void()> task) {
     if (!tl_isWorkerThread || !tl_currentContext) {
@@ -241,56 +142,47 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level, std::vector<Dim
 
     if (dimensions.empty()) return;
 
-    // Check if need to attempt recovery
-    if (mFallbackToSerial.load(std::memory_order_acquire)) {
-        int64_t currentTime = static_cast<int64_t>(mSnapshot.time);
-        if (currentTime - mLastFallbackGameTime.load(std::memory_order_relaxed) >= RECOVERY_DELAY) {
-            mFallbackToSerial.store(false, std::memory_order_release);
-            if (config.debug) {
-                logger().info("Attempting to recover parallel ticking after {} ticks", RECOVERY_DELAY);
-            }
+    // 准备维度上下文和线程
+    for (auto* dim : dimensions) {
+        int dimId = dim->getDimensionId();
+        auto& ctx = mContexts[dimId];
+        if (!ctx) {
+            ctx = std::make_unique<DimensionWorkerContext>();
+            ctx->dimension = dim;
+            ctx->startDimensionThread();
         } else {
-            serialFallbackTick(dimensions);
-            return;
+            ctx->dimension = dim;
         }
     }
 
-    if (dimensions.size() == 1) {
-        if (config.debug) {
-            logger().info("Single dimension, executing directly");
-        }
-        dimensions[0]->tick();
-        return;
-    }
-
-    // Prepare contexts
+    // 创建并行任务 - 每个维度在自己的线程中执行
+    std::vector<std::future<void>> futures;
+    futures.reserve(dimensions.size());
+    
     for (auto* dim : dimensions) {
-        int   dimId   = dim->getDimensionId();
-        auto& ctx     = mContexts[dimId];
-        ctx.dimension = dim;
-    }
-
-    // Create parallel tasks
-    std::vector<std::function<void()>> dimTasks;
-    dimTasks.reserve(dimensions.size());
-    for (auto* dim : dimensions) {
-        int   dimId = dim->getDimensionId();
-        auto& ctx   = mContexts[dimId];
-        dimTasks.emplace_back([this, &ctx]() { tickDimensionOnWorker(ctx); });
+        int dimId = dim->getDimensionId();
+        auto& ctx = mContexts[dimId];
+        
+        auto future = std::async(std::launch::async, [this, &ctx]() {
+            tickDimensionAsync(*ctx);
+        });
+        futures.push_back(std::move(future));
     }
 
     if (config.debug) {
-        logger().info("Executing {} dimension tasks in parallel", dimTasks.size());
+        logger().info("Executing {} dimension tasks asynchronously", dimensions.size());
     }
 
-    // Execute in parallel
-    mPool.executeAll(dimTasks);
+    // 等待所有任务完成
+    for (auto& future : futures) {
+        future.wait();
+    }
     
     if (config.debug) {
         logger().info("All dimension tasks completed");
     }
 
-    // Process main thread tasks
+    // 处理主线程任务
     processAllMainThreadTasks();
 
     mStats.totalParallelTicks++;
@@ -303,22 +195,20 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level, std::vector<Dim
             mStats.totalMainThreadTasks.load(),
             mStats.maxDimTickTimeUs.load()
         );
-        for (auto& [id, ctx] : mContexts) {
-            logger().info("  Dimension[{}]: {}us", id, ctx.lastTickTimeUs);
-        }
     }
 }
 
-void ParallelDimensionTickManager::tickDimensionOnWorker(DimensionWorkerContext& ctx) {
-    tl_isWorkerThread  = true;
-    tl_currentContext   = &ctx;
+void ParallelDimensionTickManager::tickDimensionAsync(DimensionWorkerContext& ctx) {
+    // 设置线程局部变量
+    tl_isWorkerThread = true;
+    tl_currentContext = &ctx;
     tl_currentDimTypeId = ctx.dimension->getDimensionId();
-    tl_currentPhase     = "pre-tick";
+    tl_currentPhase = "pre-tick";
 
     auto start = std::chrono::steady_clock::now();
 
     if (config.debug) {
-        logger().info("Worker starting tick for dimension {}", tl_currentDimTypeId);
+        logger().info("Starting tick for dimension {}", tl_currentDimTypeId);
     }
 
     try {
@@ -335,7 +225,7 @@ void ParallelDimensionTickManager::tickDimensionOnWorker(DimensionWorkerContext&
         handleTickException(ctx.dimension->getDimensionId());
     }
 
-    auto end           = std::chrono::steady_clock::now();
+    auto end = std::chrono::steady_clock::now();
     ctx.lastTickTimeUs = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
 
     uint64_t expected = mStats.maxDimTickTimeUs.load(std::memory_order_relaxed);
@@ -344,23 +234,24 @@ void ParallelDimensionTickManager::tickDimensionOnWorker(DimensionWorkerContext&
     }
 
     if (config.debug) {
-        logger().info("Worker finished tick for dimension {} ({}us)", 
+        logger().info("Finished tick for dimension {} ({}us)", 
             tl_currentDimTypeId, ctx.lastTickTimeUs);
     }
 
-    tl_isWorkerThread  = false;
-    tl_currentContext   = nullptr;
+    // 重置线程局部变量
+    tl_isWorkerThread = false;
+    tl_currentContext = nullptr;
     tl_currentDimTypeId = -1;
-    tl_currentPhase     = "idle";
+    tl_currentPhase = "idle";
 }
 
 void ParallelDimensionTickManager::processAllMainThreadTasks() {
     for (auto& [dimId, ctx] : mContexts) {
-        size_t count = ctx.mainThreadTasks.size();
+        size_t count = ctx->mainThreadTasks.size();
         if (count > 0 && config.debug) {
             logger().info("Processing {} main thread tasks for dimension {}", count, dimId);
         }
-        ctx.mainThreadTasks.processAll();
+        ctx->mainThreadTasks.processAll();
         mStats.totalMainThreadTasks += count;
     }
 }
@@ -466,7 +357,7 @@ LL_TYPE_INSTANCE_HOOK(
     DimensionTickHook,
     ll::memory::HookPriority::Normal,
     Dimension,
-    &Dimension::$tick,
+    &Dimension::tick,
     void
 ) {
     if (!config.enabled) {
@@ -495,7 +386,7 @@ LL_TYPE_INSTANCE_HOOK(
     LevelTickHook,
     ll::memory::HookPriority::Normal,
     Level,
-    &Level::$tick,
+    &Level::tick,
     void
 ) {
     if (!config.enabled) {
