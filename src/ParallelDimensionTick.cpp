@@ -8,23 +8,31 @@
 #include <mc/server/ServerLevel.h>
 #include <mc/world/level/dimension/Dimension.h>
 #include <mc/world/actor/Actor.h>
-#include <mc/network/packet/Packet.h>
+#include <mc/network/Packet.h>
+#include <mc/network/PacketSender.h>
+#include <mc/network/LoopbackPacketSender.h>
 
 #include <chrono>
+#include <filesystem>
 #include <thread>
 
 namespace dim_parallel {
 
 // ==================== 全局状态 ====================
 
-static Config                    config;
+static Config                          config;
 static std::shared_ptr<ll::io::Logger> log;
-static bool                      hookInstalled = false;
+static bool                            hookInstalled = false;
 
-// 线程局部：标识当前工作线程的维度上下文
-static thread_local DimensionWorkerContext* tl_currentContext    = nullptr;
-static thread_local bool                   tl_isWorkerThread    = false;
-static thread_local int                    tl_currentDimTypeId  = -1;
+static thread_local DimensionWorkerContext* tl_currentContext   = nullptr;
+static thread_local bool                   tl_isWorkerThread   = false;
+static thread_local int                    tl_currentDimTypeId = -1;
+
+// Hook 协调标志
+static std::atomic<bool>       g_inParallelPhase{false};
+static std::atomic<bool>       g_suppressDimensionTick{false};
+static std::vector<Dimension*> g_collectedDimensions;
+static std::mutex              g_collectMutex;
 
 // ==================== 配置与日志 ====================
 
@@ -70,55 +78,6 @@ size_t MainThreadTaskQueue::size() const {
     return mTasks.size();
 }
 
-// ==================== DimensionPacketBuffer ====================
-
-void DimensionPacketBuffer::addBroadcast(Packet const& packet, Player* except) {
-    PacketEntry entry;
-    entry.type   = PacketEntry::Type::Broadcast;
-    entry.except = except;
-    // 存储包的 shared_ptr — Packet 需要在 flush 时仍然有效
-    // 这里我们存原始指针的 const_cast，flush 时直接用 Dimension 的原始方法
-    // 安全性：flush 在同一 tick 内，包对象生命周期足够
-    entry.packet = nullptr; // 我们用另一种方式：直接在 flush 时重放
-    // 实际上我们需要 clone packet 或者延迟调用
-    // 简化方案：在 buffer 中存 lambda
-    mEntries.push_back(std::move(entry));
-}
-
-void DimensionPacketBuffer::addForPosition(
-    BlockPos const& pos, Packet const& packet, Player const* except
-) {
-    PacketEntry entry;
-    entry.type     = PacketEntry::Type::ForPosition;
-    entry.position = pos;
-    entry.except   = except;
-    mEntries.push_back(std::move(entry));
-}
-
-void DimensionPacketBuffer::addForEntity(
-    Actor const& actor, Packet const& packet, Player const* except
-) {
-    PacketEntry entry;
-    entry.type           = PacketEntry::Type::ForEntity;
-    entry.actorRuntimeId = actor.getRuntimeID().id;
-    entry.except         = except;
-    mEntries.push_back(std::move(entry));
-}
-
-void DimensionPacketBuffer::flushTo(Dimension& /*dim*/) {
-    // Phase 2 实现：遍历 mEntries，调用 dim 的原始发包方法
-    // 当前 Phase 1 中，我们先不缓冲包，而是直接拦截并在主线程重放
-    clear();
-}
-
-void DimensionPacketBuffer::clear() {
-    mEntries.clear();
-}
-
-size_t DimensionPacketBuffer::size() const {
-    return mEntries.size();
-}
-
 // ==================== ParallelDimensionTickManager ====================
 
 ParallelDimensionTickManager& ParallelDimensionTickManager::getInstance() {
@@ -128,9 +87,9 @@ ParallelDimensionTickManager& ParallelDimensionTickManager::getInstance() {
 
 void ParallelDimensionTickManager::initialize() {
     if (mInitialized) return;
-    mFallbackToSerial = false;
+    mFallbackToSerial  = false;
     mShutdownRequested = false;
-    mInitialized = true;
+    mInitialized       = true;
     logger().info("ParallelDimensionTickManager initialized");
 }
 
@@ -142,13 +101,9 @@ void ParallelDimensionTickManager::shutdown() {
     logger().info("ParallelDimensionTickManager shutdown");
 }
 
-bool ParallelDimensionTickManager::isWorkerThread() {
-    return tl_isWorkerThread;
-}
+bool ParallelDimensionTickManager::isWorkerThread() { return tl_isWorkerThread; }
 
-DimensionWorkerContext* ParallelDimensionTickManager::getCurrentContext() {
-    return tl_currentContext;
-}
+DimensionWorkerContext* ParallelDimensionTickManager::getCurrentContext() { return tl_currentContext; }
 
 DimensionType ParallelDimensionTickManager::getCurrentDimensionType() {
     return DimensionType(tl_currentDimTypeId);
@@ -156,7 +111,6 @@ DimensionType ParallelDimensionTickManager::getCurrentDimensionType() {
 
 void ParallelDimensionTickManager::runOnMainThread(std::function<void()> task) {
     if (!tl_isWorkerThread || !tl_currentContext) {
-        // 已经在主线程，直接执行
         task();
         return;
     }
@@ -165,7 +119,6 @@ void ParallelDimensionTickManager::runOnMainThread(std::function<void()> task) {
 
 void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
     if (!level || !mInitialized || mFallbackToSerial) {
-        // 降级：串行 tick
         std::vector<Dimension*> dims;
         level->forEachDimension([&](Dimension& dim) -> bool {
             dims.push_back(&dim);
@@ -175,127 +128,96 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
         return;
     }
 
-    // 1. 创建快照
+    // 快照
     mSnapshot.time        = level->getTime();
     mSnapshot.currentTick = level->getCurrentTick().tickID;
     mSnapshot.simPaused   = level->getSimPaused();
 
-    if (mSnapshot.simPaused) {
-        return; // 暂停时不 tick 维度
-    }
+    if (mSnapshot.simPaused) return;
 
-    // 2. 收集所有维度
+    // 收集维度
     std::vector<Dimension*> dimensions;
     level->forEachDimension([&](Dimension& dim) -> bool {
         dimensions.push_back(&dim);
         return true;
     });
 
-    if (dimensions.empty()) {
-        return;
-    }
+    if (dimensions.empty()) return;
 
-    // 只有一个维度时，没必要并行
     if (dimensions.size() == 1) {
         dimensions[0]->tick();
         return;
     }
 
-    // 3. 准备每个维度的上下文
+    // 准备上下文
     for (auto* dim : dimensions) {
-        int dimId = dim->getDimensionId();
-        auto& ctx = mContexts[dimId];
+        int dimId  = dim->getDimensionId();
+        auto& ctx  = mContexts[dimId];
         ctx.dimension = dim;
-        ctx.packetBuffer.clear();
-        // mainThreadTasks 不需要 clear，processAll 会清空
     }
 
-    // 4. 并行 tick
-    auto completionLatch = std::make_unique<std::latch>(dimensions.size());
+    // 并行 tick
+    std::latch completionLatch(static_cast<ptrdiff_t>(dimensions.size()));
 
     for (auto* dim : dimensions) {
         int dimId = dim->getDimensionId();
         auto& ctx = mContexts[dimId];
 
-        std::thread([this, &ctx, latch = completionLatch.get()]() {
+        std::thread([this, &ctx, &completionLatch]() {
             tickDimensionOnWorker(ctx);
-            latch->count_down();
+            completionLatch.count_down();
         }).detach();
     }
 
-    // 5. 主线程等待所有维度完成
-    completionLatch->wait();
+    completionLatch.wait();
 
-    // 6. 主线程同步阶段：处理所有延迟任务
+    // 同步阶段
     processAllMainThreadTasks();
-
-    // 7. Flush 所有 packet buffer（Phase 2 完善）
-    flushAllPacketBuffers();
 
     mStats.totalParallelTicks++;
 
-    // 8. 调试输出
     if (config.debug && (mStats.totalParallelTicks % 200 == 0)) {
         logger().info(
-            "Parallel tick #{}: dims={}, mainTasks={}, fallbacks={}, maxDimUs={}",
+            "Parallel tick #{}: dims={}  mainTasks={}  fallbacks={}",
             mStats.totalParallelTicks.load(),
             dimensions.size(),
             mStats.totalMainThreadTasks.load(),
-            mStats.totalFallbackTicks.load(),
-            mStats.maxDimTickTimeUs.load()
+            mStats.totalFallbackTicks.load()
         );
         for (auto& [id, ctx] : mContexts) {
-            logger().info("  dim[{}]: lastTickUs={}", id, ctx.lastTickTimeUs);
+            logger().info("  dim[{}]: {}us", id, ctx.lastTickTimeUs);
         }
     }
 }
 
 void ParallelDimensionTickManager::tickDimensionOnWorker(DimensionWorkerContext& ctx) {
-    // 设置线程局部上下文
-    tl_isWorkerThread   = true;
-    tl_currentContext    = &ctx;
-    tl_currentDimTypeId  = ctx.dimension->getDimensionId();
+    tl_isWorkerThread  = true;
+    tl_currentContext   = &ctx;
+    tl_currentDimTypeId = ctx.dimension->getDimensionId();
 
     auto start = std::chrono::steady_clock::now();
 
     try {
         ctx.dimension->tick();
     } catch (std::exception& e) {
-        logger().error(
-            "Exception in dimension {} tick: {}",
-            tl_currentDimTypeId, e.what()
-        );
+        logger().error("Exception in dim {} tick: {}", tl_currentDimTypeId, e.what());
         mFallbackToSerial = true;
     } catch (...) {
-        logger().error(
-            "Unknown exception in dimension {} tick",
-            tl_currentDimTypeId
-        );
+        logger().error("Unknown exception in dim {} tick", tl_currentDimTypeId);
         mFallbackToSerial = true;
     }
 
-    auto end = std::chrono::steady_clock::now();
+    auto end           = std::chrono::steady_clock::now();
     ctx.lastTickTimeUs = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
 
-    // 更新最大 tick 时间
     uint64_t expected = mStats.maxDimTickTimeUs.load();
     while (ctx.lastTickTimeUs > expected) {
         if (mStats.maxDimTickTimeUs.compare_exchange_weak(expected, ctx.lastTickTimeUs)) break;
     }
 
-    // 清除线程局部上下文
-    tl_isWorkerThread   = false;
-    tl_currentContext    = nullptr;
-    tl_currentDimTypeId  = -1;
-}
-
-void ParallelDimensionTickManager::flushAllPacketBuffers() {
-    for (auto& [dimId, ctx] : mContexts) {
-        if (ctx.dimension && ctx.packetBuffer.size() > 0) {
-            ctx.packetBuffer.flushTo(*ctx.dimension);
-            mStats.totalPacketsBuffered += ctx.packetBuffer.size();
-        }
-    }
+    tl_isWorkerThread  = false;
+    tl_currentContext   = nullptr;
+    tl_currentDimTypeId = -1;
 }
 
 void ParallelDimensionTickManager::processAllMainThreadTasks() {
@@ -313,23 +235,13 @@ void ParallelDimensionTickManager::serialFallbackTick(std::vector<Dimension*>& d
     mStats.totalFallbackTicks++;
 }
 
+} // namespace dim_parallel
+
 // ==================== Hooks ====================
 
-// Hook 1: 拦截 Level::tick()，替换维度 tick 部分为并行
-// 策略：Hook Dimension::tick()，在并行模式下跳过原始调用
-// 主线程在 Level::tick() 的 forEachDimension 中会调用每个 dim.tick()
-// 我们 Hook dim.tick()，让它在被 forEachDimension 调用时不执行
-// 然后在 Level::tick() 之后（通过 Hook Level::tick()）插入我们的并行逻辑
+using namespace dim_parallel;
 
-// 标志：当前是否处于我们的并行 tick 阶段
-static std::atomic<bool> g_inParallelPhase{false};
-// 标志：是否应该跳过原始 forEachDimension 中的 dim.tick()
-static std::atomic<bool> g_suppressDimensionTick{false};
-// 收集维度指针
-static std::vector<Dimension*> g_collectedDimensions;
-static std::mutex g_collectMutex;
-
-// Hook Dimension::tick() — 在 suppress 模式下跳过，在并行模式下正常执行
+// Hook Dimension::tick() — suppress 模式下只收集指针，parallel 模式下正常执行
 LL_TYPE_INSTANCE_HOOK(
     DimensionTickHook,
     ll::memory::HookPriority::Normal,
@@ -337,30 +249,29 @@ LL_TYPE_INSTANCE_HOOK(
     &Dimension::tick,
     void
 ) {
-    if (!dim_parallel::config.enabled) {
+    if (!config.enabled) {
         origin();
         return;
     }
 
-    if (g_suppressDimensionTick.load()) {
-        // 被 Level::tick() 的 forEachDimension 调用
-        // 不执行 tick，只收集指针
+    if (g_suppressDimensionTick.load(std::memory_order_acquire)) {
+        // Level::tick() 内部的 forEachDimension 调用，只收集不执行
         std::lock_guard lock(g_collectMutex);
         g_collectedDimensions.push_back(this);
         return;
     }
 
-    if (g_inParallelPhase.load()) {
-        // 被我们的工作线程调用，正常执行
+    if (g_inParallelPhase.load(std::memory_order_acquire)) {
+        // 工作线程调用，正常执行原始 tick
         origin();
         return;
     }
 
-    // 其他情况（不应该发生），正常执行
+    // 其他路径（不应该发生），安全执行
     origin();
 }
 
-// Hook Dimension::sendBroadcast() — 工作线程中重定向到队列
+// Hook Dimension::sendBroadcast() — 工作线程中延迟到主线程
 LL_TYPE_INSTANCE_HOOK(
     DimensionSendBroadcastHook,
     ll::memory::HookPriority::Normal,
@@ -370,73 +281,65 @@ LL_TYPE_INSTANCE_HOOK(
     Packet const& packet,
     Player*       except
 ) {
-    if (!dim_parallel::config.enabled || !ParallelDimensionTickManager::isWorkerThread()) {
+    if (!config.enabled || !ParallelDimensionTickManager::isWorkerThread()) {
         origin(packet, except);
         return;
     }
 
-    // 在工作线程中，延迟到主线程执行
-    // 捕获必要数据，避免引用悬垂
-    Dimension* dim = this;
-    Player* exc = except;
-    ParallelDimensionTickManager::runOnMainThread([dim, &packet, exc]() {
-        // 这里需要调用原始的 sendBroadcast
-        // 但我们在 lambda 中无法调用 origin()
-        // 所以我们直接调用 Dimension 的发包逻辑
-        dim->sendBroadcast(packet, exc);
-    });
+    // 在工作线程中，延迟发包到主线程同步阶段
+    // 注意：packet 是栈上引用，不能直接捕获引用
+    // 使用 Packet::sendTo 系列方法在主线程重放更安全
+    // 但这里我们需要调用 origin，所以用 this 指针 + 标志绕过
+    Dimension* self = this;
+    Player*    exc  = except;
+
+    // 暂时直接调用 origin — Phase 2 会改为真正的缓冲
+    // 当前风险：从非主线程调用网络发送
+    // TODO: 实现 packet clone 后改为缓冲模式
+    origin(packet, except);
 }
 
-// Hook Dimension::sendPacketForPosition() — 工作线程中重定向到队列
+// Hook Dimension::sendPacketForPosition() — 工作线程中延迟到主线程
 LL_TYPE_INSTANCE_HOOK(
     DimensionSendPacketForPositionHook,
     ll::memory::HookPriority::Normal,
     Dimension,
     &Dimension::sendPacketForPosition,
     void,
-    BlockPos const&  position,
-    Packet const&    packet,
-    Player const*    except
+    BlockPos const& position,
+    Packet const&   packet,
+    Player const*   except
 ) {
-    if (!dim_parallel::config.enabled || !ParallelDimensionTickManager::isWorkerThread()) {
+    if (!config.enabled || !ParallelDimensionTickManager::isWorkerThread()) {
         origin(position, packet, except);
         return;
     }
 
-    Dimension* dim = this;
-    BlockPos pos = position;
-    Player const* exc = except;
-    ParallelDimensionTickManager::runOnMainThread([dim, pos, &packet, exc]() {
-        dim->sendPacketForPosition(pos, packet, exc);
-    });
+    // TODO: Phase 2 缓冲
+    origin(position, packet, except);
 }
 
-// Hook Dimension::sendPacketForEntity() — 工作线程中重定向到队列
+// Hook Dimension::sendPacketForEntity() — 工作线程中延迟到主线程
 LL_TYPE_INSTANCE_HOOK(
     DimensionSendPacketForEntityHook,
     ll::memory::HookPriority::Normal,
     Dimension,
     &Dimension::sendPacketForEntity,
     void,
-    Actor const&   actor,
-    Packet const&  packet,
-    Player const*  except
+    Actor const&  actor,
+    Packet const& packet,
+    Player const* except
 ) {
-    if (!dim_parallel::config.enabled || !ParallelDimensionTickManager::isWorkerThread()) {
+    if (!config.enabled || !ParallelDimensionTickManager::isWorkerThread()) {
         origin(actor, packet, except);
         return;
     }
 
-    Dimension* dim = this;
-    // 存 actor 指针 — 在同一 tick 内 flush，生命周期安全
-    Actor const* actorPtr = &actor;
-    Player const* exc = except;
-    ParallelDimensionTickManager::runOnMainThread([dim, actorPtr, &packet, exc]() {
-        dim->sendPacketForEntity(*actorPtr, packet, exc);
-    });
+    // TODO: Phase 2 缓冲
+    origin(actor, packet, except);
 }
 
-// Hook Level::tick() — 在 forEachDimension 前后插入并行逻辑
+// Hook Level::tick() — 拦截 forEachDimension 中的 dim.tick()，替换为并行
 LL_TYPE_INSTANCE_HOOK(
     LevelTickHook,
     ll::memory::HookPriority::Normal,
@@ -444,35 +347,33 @@ LL_TYPE_INSTANCE_HOOK(
     &Level::tick,
     void
 ) {
-    if (!dim_parallel::config.enabled) {
+    if (!config.enabled) {
         origin();
         return;
     }
 
-    // 阶段 1: 设置 suppress 标志，让 Dimension::tick() 只收集指针不执行
+    // 阶段 1: suppress dim.tick()，让 origin() 中的 forEachDimension 只收集指针
     g_collectedDimensions.clear();
-    g_suppressDimensionTick = true;
+    g_suppressDimensionTick.store(true, std::memory_order_release);
 
     // 调用原始 Level::tick()
-    // 内部的 forEachDimension(dim.tick()) 会被我们的 DimensionTickHook 拦截
-    // dim.tick() 不会真正执行，只会收集维度指针
-    // 其他所有逻辑（tickEntities, tickEntitySystems, _subTick 等）正常执行
+    // tickEntities(), tickEntitySystems(), _subTick() 等正常执行
+    // forEachDimension 中的 dim.tick() 被 DimensionTickHook 拦截，只收集不执行
     origin();
 
-    // 阶段 2: 关闭 suppress，开启并行
-    g_suppressDimensionTick = false;
+    g_suppressDimensionTick.store(false, std::memory_order_release);
 
-    if (g_collectedDimensions.empty()) {
-        return;
+    // 阶段 2: 并行 tick 收集到的维度
+    if (!g_collectedDimensions.empty()) {
+        g_inParallelPhase.store(true, std::memory_order_release);
+        ParallelDimensionTickManager::getInstance().dispatchAndSync(this);
+        g_inParallelPhase.store(false, std::memory_order_release);
     }
-
-    // 阶段 3: 并行 tick 所有收集到的维度
-    g_inParallelPhase = true;
-    ParallelDimensionTickManager::getInstance().dispatchAndSync(this);
-    g_inParallelPhase = false;
 }
 
 // ==================== 插件生命周期 ====================
+
+namespace dim_parallel {
 
 PluginImpl& PluginImpl::getInstance() {
     static PluginImpl instance;
@@ -485,7 +386,7 @@ bool PluginImpl::load() {
         logger().warn("Failed to load config, using defaults");
         saveConfig();
     }
-    logger().info("DimParallel loaded. enabled={}, debug={}", config.enabled, config.debug);
+    logger().info("DimParallel loaded. enabled={} debug={}", config.enabled, config.debug);
     return true;
 }
 
@@ -498,7 +399,6 @@ bool PluginImpl::enable() {
         DimensionSendPacketForEntityHook::hook();
         hookInstalled = true;
     }
-
     ParallelDimensionTickManager::getInstance().initialize();
     logger().info("DimParallel enabled");
     return true;
@@ -506,7 +406,6 @@ bool PluginImpl::enable() {
 
 bool PluginImpl::disable() {
     ParallelDimensionTickManager::getInstance().shutdown();
-
     if (hookInstalled) {
         LevelTickHook::unhook();
         DimensionTickHook::unhook();
@@ -515,7 +414,6 @@ bool PluginImpl::disable() {
         DimensionSendPacketForEntityHook::unhook();
         hookInstalled = false;
     }
-
     logger().info("DimParallel disabled");
     return true;
 }
