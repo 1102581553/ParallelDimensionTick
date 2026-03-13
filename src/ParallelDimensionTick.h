@@ -17,6 +17,7 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#include <queue>
 
 namespace dim_parallel {
 
@@ -24,6 +25,9 @@ struct Config {
     int  version = 1;
     bool enabled = true;
     bool debug   = false;
+    
+    // 完全隔离配置
+    bool enableCompleteIsolation = true;  // 启用完全隔离
 };
 
 Config&         getConfig();
@@ -52,31 +56,96 @@ struct DimensionWorkerContext {
     Dimension*          dimension = nullptr;
     MainThreadTaskQueue mainThreadTasks;
     uint64_t            lastTickTimeUs = 0;
-};
-
-class WorkerPool {
-public:
-    void start(int numWorkers);
-    void stop();
-    void executeAll(std::vector<std::function<void()>>& tasks);
-    int  workerCount() const { return static_cast<int>(mThreads.size()); }
-
-private:
-    void workerLoop();
-
-    struct Batch {
-        std::vector<std::function<void()>>* tasks = nullptr;
-        std::atomic<int> nextIdx{0};
-        std::atomic<int> doneCount{0};
-        std::atomic<bool> completed{false};
-    };
-
-    std::vector<std::thread>    mThreads;
-    std::mutex                  mMutex;
-    std::condition_variable     mWakeCV;
-    Batch                       mBatch;
-    std::atomic<uint64_t>       mGeneration{0};
-    std::atomic<bool>           mShutdown{false};
+    
+    // 维度专属线程
+    std::thread         workerThread;
+    std::queue<std::function<void()>> taskQueue;
+    std::mutex          queueMutex;
+    std::condition_variable taskCV;
+    std::atomic<bool>   shouldStop{false};
+    std::atomic<bool>   isWorking{false};
+    std::atomic<bool>   hasPendingWork{false};
+    
+    // 线程安全的构造和析构
+    DimensionWorkerContext() = default;
+    
+    // 启动维度专属线程
+    void startDimensionThread() {
+        if (!workerThread.joinable()) {
+            workerThread = std::thread([this]() {
+                #ifdef _WIN32
+                wchar_t name[64];
+                swprintf(name, L"Dim_%d_Thread", 
+                         this->dimension ? this->dimension->getDimensionId() : -1);
+                SetThreadDescription(GetCurrentThread(), name);
+                #endif
+                
+                while (!shouldStop.load(std::memory_order_acquire)) {
+                    std::function<void()> task;
+                    
+                    // 等待任务
+                    {
+                        std::unique_lock lock(queueMutex);
+                        taskCV.wait(lock, [this] { 
+                            return hasPendingWork.load(std::memory_order_acquire) || 
+                                   shouldStop.load(std::memory_order_acquire); 
+                        });
+                        
+                        if (shouldStop.load(std::memory_order_acquire) && taskQueue.empty()) {
+                            break;
+                        }
+                        
+                        if (!taskQueue.empty()) {
+                            task = std::move(taskQueue.front());
+                            taskQueue.pop();
+                            hasPendingWork.store(!taskQueue.empty(), std::memory_order_release);
+                        }
+                    }
+                    
+                    // 执行任务
+                    if (task) {
+                        isWorking.store(true, std::memory_order_release);
+                        try {
+                            task();
+                        } catch (...) {
+                            logger().error("Exception in dimension {} thread task", 
+                                         dimension ? dimension->getDimensionId() : -1);
+                        }
+                        isWorking.store(false, std::memory_order_release);
+                    }
+                }
+            });
+        }
+    }
+    
+    // 添加tick任务到队列
+    void addTickTask(std::function<void()> task) {
+        {
+            std::lock_guard lock(queueMutex);
+            taskQueue.push(std::move(task));
+        }
+        hasPendingWork.store(true, std::memory_order_release);
+        taskCV.notify_one();
+    }
+    
+    // 等待当前任务完成
+    void waitForCompletion() {
+        std::unique_lock lock(queueMutex);
+        taskCV.wait(lock, [this] { 
+            return !hasPendingWork.load(std::memory_order_acquire) && 
+                   !isWorking.load(std::memory_order_acquire); 
+        });
+    }
+    
+    // 关闭线程
+    void shutdown() {
+        shouldStop.store(true, std::memory_order_release);
+        taskCV.notify_all();
+        
+        if (workerThread.joinable()) {
+            workerThread.join();
+        }
+    }
 };
 
 class ParallelDimensionTickManager {
@@ -92,8 +161,6 @@ public:
     static DimensionType           getCurrentDimensionType();
     static void                    runOnMainThread(std::function<void()> task);
 
-    WorkerPool& getWorkerPool() { return mPool; }
-
     struct Stats {
         std::atomic<uint64_t> totalParallelTicks{0};
         std::atomic<uint64_t> totalFallbackTicks{0};
@@ -105,14 +172,13 @@ public:
 private:
     ParallelDimensionTickManager() = default;
 
-    void tickDimensionOnWorker(DimensionWorkerContext& ctx);
+    void tickDimensionAsync(DimensionWorkerContext& ctx);
     void processAllMainThreadTasks();
     void serialFallbackTick(std::vector<Dimension*>& dimensions);
     void handleTickException(int dimId);
 
-    std::unordered_map<int, DimensionWorkerContext> mContexts;
+    std::unordered_map<int, std::unique_ptr<DimensionWorkerContext>> mContexts;
     LevelTickSnapshot                               mSnapshot;
-    WorkerPool                                      mPool;
     std::atomic<bool>                               mFallbackToSerial{false};
     std::atomic<int64_t>                            mLastFallbackGameTime{0};
     static constexpr int64_t                        RECOVERY_DELAY = 200;
@@ -125,6 +191,7 @@ public:
     static PluginImpl& getInstance();
     PluginImpl() : mSelf(*ll::mod::NativeMod::current()) {}
     [[nodiscard]] ll::mod::NativeMod& getSelf() const { return mSelf; }
+    
     bool load();
     bool enable();
     bool disable();
