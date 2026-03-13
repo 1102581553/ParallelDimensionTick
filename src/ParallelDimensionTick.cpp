@@ -55,21 +55,6 @@ bool saveConfig() {
     return ll::config::saveConfig(config, path);
 }
 
-void MainThreadTaskQueue::enqueue(std::function<void()> task) {
-    mQueue.enqueue(std::move(task));
-}
-
-void MainThreadTaskQueue::processAll() {
-    std::function<void()> task;
-    while (mQueue.dequeue(task)) {
-        task();
-    }
-}
-
-size_t MainThreadTaskQueue::size() const {
-    return mQueue.size();
-}
-
 //=============================================================================
 // ParallelDimensionTickManager implementation
 //=============================================================================
@@ -84,7 +69,7 @@ void ParallelDimensionTickManager::initialize() {
     mFallbackToSerial = false;
     mFallbackStartTick = 0;
     mInitialized = true;
-    logger().info("Initialized lock-free per-dimension thread model");
+    logger().info("Initialized double-buffer per-dimension thread model");
 }
 
 void ParallelDimensionTickManager::shutdown() {
@@ -238,12 +223,11 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
         }
     }
 
-    // 异步启动所有维度 tick（不等待完成）
+    // 异步启动所有维度 tick
     for (auto* dim : validDims) {
         int dimId = dim->getDimensionId();
         auto& ctx = *mContexts[dimId];
         
-        // 如果上一个 tick 还没完成，跳过本次
         if (ctx.isProcessing.load(std::memory_order_acquire)) {
             uint64_t skipped = ctx.skippedTicks.fetch_add(1, std::memory_order_relaxed) + 1;
             ctx.totalSkippedTicks.fetch_add(1, std::memory_order_relaxed);
@@ -256,7 +240,6 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
             continue;
         }
 
-        // 重置连续跳过计数
         uint64_t prevSkipped = ctx.skippedTicks.exchange(0, std::memory_order_relaxed);
         if (prevSkipped > 0 && config.debug) {
             logger().info("Dimension {} recovered after {} skipped ticks", dimId, prevSkipped);
