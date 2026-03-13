@@ -8,7 +8,10 @@
 #include <mc/server/ServerLevel.h>
 #include <mc/world/level/dimension/Dimension.h>
 #include <mc/world/level/Tick.h>
+#include <mc/world/level/EntitySystemsManager.h>
 #include <mc/world/actor/Actor.h>
+#include <mc/world/level/BlockSource.h>
+#include <mc/world/level/chunk/LevelChunk.h>
 #include <mc/network/Packet.h>
 #include <mc/network/PacketSender.h>
 #include <mc/network/LoopbackPacketSender.h>
@@ -32,6 +35,18 @@ static std::atomic<bool>       g_inParallelPhase{false};
 static std::atomic<bool>       g_suppressDimensionTick{false};
 static std::vector<Dimension*> g_collectedDimensions;
 static std::mutex              g_collectMutex;
+
+// Actor tick 并行控制
+static std::atomic<bool> g_suppressActorTick{false};
+
+struct DeferredActorTick {
+    Actor*       actor;
+    BlockSource* region;
+    int          dimId;
+};
+static std::mutex                       g_actorCollectMutex;
+static std::vector<DeferredActorTick>   g_collectedActorTicks;
+static std::atomic<bool>                g_inActorParallelPhase{false};
 
 Config& getConfig() { return config; }
 
@@ -87,7 +102,6 @@ void WorkerPool::start(int numWorkers) {
     }
 }
 
-
 void WorkerPool::stop() {
     {
         std::lock_guard lock(mMutex);
@@ -103,7 +117,6 @@ void WorkerPool::stop() {
 
 void WorkerPool::executeAll(std::vector<std::function<void()>>& tasks) {
     if (tasks.empty()) return;
-
     int count = static_cast<int>(tasks.size());
 
     mBatch.tasks = tasks.data();
@@ -134,7 +147,6 @@ void WorkerPool::executeAll(std::vector<std::function<void()>>& tasks) {
 
 void WorkerPool::workerLoop(int) {
     uint64_t localGen = 0;
-
     while (true) {
         {
             std::unique_lock lock(mMutex);
@@ -144,7 +156,6 @@ void WorkerPool::workerLoop(int) {
             if (mShutdown) return;
             localGen = mGeneration;
         }
-
         if (mBatch.tasks) {
             int count = mBatch.count;
             while (true) {
@@ -165,13 +176,10 @@ ParallelDimensionTickManager& ParallelDimensionTickManager::getInstance() {
 void ParallelDimensionTickManager::initialize() {
     if (mInitialized) return;
     mFallbackToSerial = false;
-
     int hwThreads  = static_cast<int>(std::thread::hardware_concurrency());
     int numWorkers = std::max(1, hwThreads - 1);
-
     mPool.start(numWorkers);
     mInitialized = true;
-
     logger().info("Initialized: {} hw threads, {} workers + main thread", hwThreads, numWorkers);
 }
 
@@ -239,12 +247,14 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
 
     if (config.debug && (mStats.totalParallelTicks % 200 == 0)) {
         logger().info(
-            "Parallel tick #{}: dims={}  mainTasks={}  fallbacks={}  workers={}",
+            "Parallel tick #{}: dims={}  mainTasks={}  fallbacks={}  workers={}  actorSup={}  actorPar={}",
             mStats.totalParallelTicks.load(),
             dimensions.size(),
             mStats.totalMainThreadTasks.load(),
             mStats.totalFallbackTicks.load(),
-            mPool.workerCount()
+            mPool.workerCount(),
+            mStats.actorTicksSuppressed.load(),
+            mStats.actorTicksParallel.load()
         );
         for (auto& [id, ctx] : mContexts) {
             logger().info("  dim[{}]: {}us", id, ctx.lastTickTimeUs);
@@ -304,6 +314,8 @@ void ParallelDimensionTickManager::serialFallbackTick(std::vector<Dimension*>& d
 } // namespace dim_parallel
 
 using namespace dim_parallel;
+
+// ==================== Dimension Hooks ====================
 
 LL_TYPE_INSTANCE_HOOK(
     DimensionTickRedstoneHook,
@@ -471,6 +483,112 @@ LL_TYPE_INSTANCE_HOOK(
     origin(actor, packet, except);
 }
 
+// ==================== Actor tick 并行化 ====================
+
+// 策略：hook Actor::tick，在 suppress 阶段收集所有 actor tick 调用
+// 然后按维度分组，并行执行
+
+LL_TYPE_INSTANCE_HOOK(
+    ActorTickHook,
+    ll::memory::HookPriority::Normal,
+    Actor,
+    &Actor::tick,
+    bool,
+    BlockSource& region
+) {
+    if (!config.enabled || !config.parallelActorTick) {
+        return origin(region);
+    }
+
+    if (g_suppressActorTick.load(std::memory_order_acquire)) {
+        // 收集阶段：记录 actor 和 region，不执行
+        int dimId = static_cast<int>(region.getDimensionId());
+        {
+            std::lock_guard lock(g_actorCollectMutex);
+            g_collectedActorTicks.push_back({this, &region, dimId});
+        }
+        ParallelDimensionTickManager::getInstance().getStats().actorTicksSuppressed++;
+        return false; // 返回 false 表示未处理
+    }
+
+    if (g_inActorParallelPhase.load(std::memory_order_acquire)) {
+        // 并行执行阶段：正常 tick
+        return origin(region);
+    }
+
+    return origin(region);
+}
+
+// ==================== EntitySystemsManager hook ====================
+
+// Hook tickEntitySystems：收集 actor ticks，按维度并行执行
+LL_TYPE_INSTANCE_HOOK(
+    EntitySystemsManagerTickHook,
+    ll::memory::HookPriority::Normal,
+    EntitySystemsManager,
+    &EntitySystemsManager::tickEntitySystems,
+    void
+) {
+    if (!config.enabled || !config.parallelActorTick) {
+        origin();
+        return;
+    }
+
+    // 阶段 1：suppress Actor::tick，收集所有 actor tick 调用
+    g_collectedActorTicks.clear();
+    g_suppressActorTick.store(true, std::memory_order_release);
+
+    // 调用原始 tickEntitySystems
+    // 内部的 ECS system 会遍历实体并调用 Actor::tick
+    // 我们的 ActorTickHook 会拦截并收集而不执行
+    origin();
+
+    g_suppressActorTick.store(false, std::memory_order_release);
+
+    // 阶段 2：按维度分组
+    std::unordered_map<int, std::vector<DeferredActorTick>> byDimension;
+    for (auto& entry : g_collectedActorTicks) {
+        byDimension[entry.dimId].push_back(entry);
+    }
+
+    if (byDimension.empty()) return;
+
+    // 如果只有一个维度，串行执行
+    if (byDimension.size() == 1) {
+        g_inActorParallelPhase.store(true, std::memory_order_release);
+        for (auto& entry : g_collectedActorTicks) {
+            entry.actor->tick(*entry.region);
+        }
+        g_inActorParallelPhase.store(false, std::memory_order_release);
+        return;
+    }
+
+    // 阶段 3：并行执行每个维度的 actor ticks
+    std::vector<std::function<void()>> tasks;
+    tasks.reserve(byDimension.size());
+
+    auto& stats = ParallelDimensionTickManager::getInstance().getStats();
+
+    for (auto& [dimId, actors] : byDimension) {
+        tasks.emplace_back([&actors, &stats]() {
+            for (auto& entry : actors) {
+                try {
+                    entry.actor->tick(*entry.region);
+                    stats.actorTicksParallel++;
+                } catch (...) {
+                    // 单个 actor 崩溃不应该影响其他
+                }
+            }
+        });
+    }
+
+    g_inActorParallelPhase.store(true, std::memory_order_release);
+    ParallelDimensionTickManager::getInstance().getWorkerPool().executeAll(tasks);
+    g_inActorParallelPhase.store(false, std::memory_order_release);
+}
+
+// ==================== Level tick hook ====================
+
 LL_TYPE_INSTANCE_HOOK(
     LevelTickHook,
     ll::memory::HookPriority::Normal,
@@ -497,6 +615,8 @@ LL_TYPE_INSTANCE_HOOK(
     }
 }
 
+// ==================== 插件生命周期 ====================
+
 namespace dim_parallel {
 
 PluginImpl& PluginImpl::getInstance() {
@@ -510,7 +630,8 @@ bool PluginImpl::load() {
         logger().warn("Failed to load config, using defaults");
         saveConfig();
     }
-    logger().info("DimParallel loaded. enabled={} debug={}", config.enabled, config.debug);
+    logger().info("DimParallel loaded. enabled={} debug={} actorTick={} chunkTick={}",
+        config.enabled, config.debug, config.parallelActorTick, config.parallelChunkTick);
     return true;
 }
 
@@ -526,6 +647,12 @@ bool PluginImpl::enable() {
         DimensionSendBroadcastHook::hook();
         DimensionSendPacketForPositionHook::hook();
         DimensionSendPacketForEntityHook::hook();
+
+        if (config.parallelActorTick) {
+            ActorTickHook::hook();
+            EntitySystemsManagerTickHook::hook();
+        }
+
         hookInstalled = true;
     }
     ParallelDimensionTickManager::getInstance().initialize();
@@ -546,6 +673,12 @@ bool PluginImpl::disable() {
         DimensionSendBroadcastHook::unhook();
         DimensionSendPacketForPositionHook::unhook();
         DimensionSendPacketForEntityHook::unhook();
+
+        if (config.parallelActorTick) {
+            ActorTickHook::unhook();
+            EntitySystemsManagerTickHook::unhook();
+        }
+
         hookInstalled = false;
     }
     logger().info("DimParallel disabled");
@@ -555,3 +688,4 @@ bool PluginImpl::disable() {
 } // namespace dim_parallel
 
 LL_REGISTER_MOD(dim_parallel::PluginImpl, dim_parallel::PluginImpl::getInstance());
+
