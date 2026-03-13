@@ -157,7 +157,9 @@ struct DimensionWorkerContext {
     }
 };
 
-class ParallelDimensionTickManager static ParallelDimensionTickManager& getInstance();
+class ParallelDimensionTickManager {
+public:
+    static ParallelDimensionTickManager& getInstance();
 
     void initialize();
     void shutdown();
