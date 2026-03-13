@@ -35,6 +35,9 @@ static std::atomic<bool>       g_suppressDimensionTick{false};
 static std::vector<Dimension*> g_collectedDimensions;
 static std::mutex              g_collectMutex;
 
+// Definition of static member
+MainThreadTaskQueue ParallelDimensionTickManager::mMainThreadTasks;
+
 Config& getConfig() { return config; }
 
 ll::io::Logger& logger() {
@@ -121,7 +124,7 @@ void ParallelDimensionTickManager::runOnMainThread(std::function<void()> task) {
         task();
         return;
     }
-    // Push to global main thread task queue
+    // Push to global main thread task queue (static member)
     mMainThreadTasks.enqueue(std::move(task));
 }
 
@@ -301,7 +304,7 @@ void ParallelDimensionTickManager::tickDimensionOnWorker(DimensionWorkerContext&
 void ParallelDimensionTickManager::processAllMainThreadTasks() {
     size_t count = mMainThreadTasks.size();
     mMainThreadTasks.processAll();
-    mStats.totalMainThreadTasks += count;
+    mStats.totalMainThreadTasks += static_cast<uint64_t>(count); // Cast to avoid warning
 }
 
 void ParallelDimensionTickManager::serialFallbackTick(std::vector<Dimension*>& dimensions) {
