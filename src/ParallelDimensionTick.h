@@ -14,7 +14,6 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
-#include <deque>
 
 namespace dim_parallel {
 
@@ -29,7 +28,6 @@ bool loadConfig();
 bool saveConfig();
 ll::io::Logger& logger();
 
-// 简化的无锁任务队列（使用批处理减少竞争）
 class MainThreadTaskQueue {
 public:
     MainThreadTaskQueue() : mWriteBuffer(0) {}
@@ -41,16 +39,16 @@ public:
     }
 
     void processAll() {
-        // 切换缓冲区
-        int readIdx = mWriteBuffer.exchange(1 - mWriteBuffer.load(std::memory_order_relaxed), 
-                                            std::memory_order_acquire);
-        
+        int readIdx = mWriteBuffer.load(std::memory_order_relaxed);
+        int newWrite = 1 - readIdx;
+        mWriteBuffer.store(newWrite, std::memory_order_release);
+
         std::vector<std::function<void()>> tasks;
         {
             std::lock_guard lock(mBufferMutex[readIdx]);
             tasks.swap(mBuffers[readIdx]);
         }
-        
+
         for (auto& task : tasks) {
             task();
         }
@@ -86,9 +84,7 @@ struct DimensionWorkerContext {
     std::atomic<bool> shouldWork{false};
     std::atomic<bool> shutdown{false};
     std::atomic<bool> tickCompleted{false};
-    std::atomic<bool> isProcessing{false};
     std::atomic<uint64_t> tickNumber{0};
-    std::atomic<uint64_t> skippedTicks{0};
     std::atomic<uint64_t> totalSkippedTicks{0};
 };
 
@@ -115,7 +111,6 @@ public:
         std::atomic<uint64_t> totalDangerousFunctions{0};
         std::atomic<uint64_t> totalSkippedDimensions{0};
         std::atomic<uint64_t> cycleMainThreadTasks{0};
-        std::atomic<uint64_t> totalTicksSkippedDueToBacklog{0};
     };
     Stats& getStats() { return mStats; }
 
@@ -132,6 +127,7 @@ private:
     Stats mStats;
 
     static constexpr uint64_t RECOVERY_INTERVAL_TICKS = 20;
+    static constexpr uint64_t WAIT_TIMEOUT_US = 100000; // 100ms 超时
     uint64_t mFallbackStartTick = 0;
 
     static std::unordered_set<std::string> m_dangerousFunctions;
