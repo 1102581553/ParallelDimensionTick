@@ -63,14 +63,17 @@ public:
 private:
     void workerLoop();
 
-    std::vector<std::thread>            mWorkers;
-    std::mutex                          mMutex;
-    std::condition_variable             mWorkerCV;
-    std::condition_variable             mDoneCV;
-    std::vector<std::function<void()>>* mCurrentTasks = nullptr;
-    std::atomic<int>                    mTaskIndex{0};
-    std::atomic<int>                    mTasksRemaining{0};
-    bool                                mShutdown = false;
+    std::vector<std::thread> mWorkers;
+    std::mutex               mMutex;
+    std::condition_variable  mStartCV;
+    std::condition_variable  mDoneCV;
+
+    std::vector<std::function<void()>> mTasks;
+    std::atomic<int>                   mTaskIndex{0};
+    std::atomic<int>                   mTasksRemaining{0};
+    uint64_t                           mGeneration = 0;
+    uint64_t                           mWorkerGen  = 0;
+    bool                               mShutdown   = false;
 };
 
 class ParallelDimensionTickManager {
