@@ -19,6 +19,8 @@
 #include <filesystem>
 #include <algorithm>
 
+#include <Windows.h>
+
 namespace dim_parallel {
 
 static Config                          config;
@@ -86,9 +88,15 @@ size_t MainThreadTaskQueue::size() const {
     return mTasks.size();
 }
 
+unsigned long __stdcall WorkerPool::threadEntry(void* param) {
+    auto* pool = static_cast<WorkerPool*>(param);
+    pool->workerLoop();
+    return 0;
+}
+
 void WorkerPool::start(int numWorkers) {
     std::lock_guard lock(mMutex);
-    if (!mWorkers.empty()) return;
+    if (!mHandles.empty()) return;
     mShutdown   = false;
     mGeneration = 0;
     mBatch.tasks = nullptr;
@@ -96,7 +104,15 @@ void WorkerPool::start(int numWorkers) {
     mBatch.nextIdx.store(0, std::memory_order_relaxed);
     mBatch.doneCount.store(0, std::memory_order_relaxed);
     for (int i = 0; i < numWorkers; i++) {
-        mWorkers.emplace_back([this, i]() { workerLoop(i); });
+        void* h = CreateThread(
+            nullptr,
+            8 * 1024 * 1024,  // 8MB stack
+            threadEntry,
+            this,
+            0,
+            nullptr
+        );
+        if (h) mHandles.push_back(h);
     }
 }
 
@@ -107,10 +123,11 @@ void WorkerPool::stop() {
         mGeneration++;
     }
     mWakeCV.notify_all();
-    for (auto& w : mWorkers) {
-        if (w.joinable()) w.join();
+    for (auto h : mHandles) {
+        WaitForSingleObject(h, INFINITE);
+        CloseHandle(h);
     }
-    mWorkers.clear();
+    mHandles.clear();
 }
 
 void WorkerPool::executeAll(std::vector<std::function<void()>>& tasks) {
@@ -143,7 +160,7 @@ void WorkerPool::executeAll(std::vector<std::function<void()>>& tasks) {
     mBatch.count = 0;
 }
 
-void WorkerPool::workerLoop(int) {
+void WorkerPool::workerLoop() {
     uint64_t localGen = 0;
     while (true) {
         {
@@ -165,6 +182,7 @@ void WorkerPool::workerLoop(int) {
         }
     }
 }
+
 
 ParallelDimensionTickManager& ParallelDimensionTickManager::getInstance() {
     static ParallelDimensionTickManager instance;
