@@ -24,7 +24,6 @@ struct Config {
     int  version = 1;
     bool enabled = true;
     bool debug   = false;
-    // Recovery interval hardcoded to 20 ticks (1 second)
 };
 
 Config&         getConfig();
@@ -50,8 +49,9 @@ struct LevelTickSnapshot {
 };
 
 struct DimensionWorkerContext {
-    Dimension* dimension = nullptr;
-    uint64_t   lastTickTimeUs = 0;
+    Dimension*          dimension = nullptr;
+    uint64_t            lastTickTimeUs = 0;
+    MainThreadTaskQueue mainThreadTasks;  // Per-dimension task queue
 
     // Per-dimension thread resources
     std::thread                 workerThread;
@@ -85,7 +85,7 @@ public:
         std::atomic<uint64_t> totalMainThreadTasks{0};
         std::atomic<uint64_t> maxDimTickTimeUs{0};
         std::atomic<uint64_t> totalRecoveryAttempts{0};
-        std::atomic<uint64_t> totalDangerousFunctions{0};  // Number of functions marked dangerous
+        std::atomic<uint64_t> totalDangerousFunctions{0};
     };
     Stats& getStats() { return mStats; }
 
@@ -93,7 +93,6 @@ private:
     ParallelDimensionTickManager() = default;
 
     void tickDimensionOnWorker(DimensionWorkerContext& ctx);
-    void processAllMainThreadTasks();
     void serialFallbackTick(std::vector<Dimension*>& dimensions);
     void workerLoop(DimensionWorkerContext* ctx);
 
@@ -102,9 +101,6 @@ private:
     std::atomic<bool>                               mFallbackToSerial{false};
     bool                                             mInitialized = false;
     Stats                                            mStats;
-
-    // Global main thread task queue (static for access from static methods)
-    static MainThreadTaskQueue                       mMainThreadTasks;
 
     // Recovery mechanism
     static constexpr uint64_t                        RECOVERY_INTERVAL_TICKS = 20; // 1 second at 20 tps
