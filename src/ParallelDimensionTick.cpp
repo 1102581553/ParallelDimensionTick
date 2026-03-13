@@ -535,6 +535,55 @@ inline void handleDangerousFunction(const char* funcName, Func&& func, Args&&...
 //=============================================================================
 // Hooks
 //=============================================================================
+LL_TYPE_INSTANCE_HOOK(
+    LevelTickHook,
+    ll::memory::HookPriority::Normal,
+    Level,
+    &Level::$tick,
+    void
+) {
+    static thread_local bool inHook = false;
+    if (!config.enabled) {
+        origin();
+        return;
+    }
+    if (inHook) {
+        origin();
+        return;
+    }
+    inHook = true;
+
+    {
+        std::lock_guard<std::mutex> lock(g_dimensionCollectionMutex);
+        g_collectedDimensions.clear();
+    }
+
+    g_suppressDimensionTick.store(true, std::memory_order_release);
+
+    this->forEachDimension([&](Dimension& dim) -> bool {
+        std::lock_guard<std::mutex> lock(g_dimensionCollectionMutex);
+        g_collectedDimensions.emplace_back(&dim);
+        return true;
+    });
+
+    origin();
+
+    g_suppressDimensionTick.store(false, std::memory_order_release);
+
+    bool hasDimensions = false;
+    {
+        std::lock_guard<std::mutex> lock(g_dimensionCollectionMutex);
+        hasDimensions = !g_collectedDimensions.empty();
+    }
+
+    if (hasDimensions) {
+        g_inParallelPhase.store(true, std::memory_order_release);
+        ParallelDimensionTickManager::getInstance().dispatchAndSync(this);
+        g_inParallelPhase.store(false, std::memory_order_release);
+    }
+
+    inHook = false;
+}
 
 LL_TYPE_INSTANCE_HOOK(
     DimensionTickHook,
