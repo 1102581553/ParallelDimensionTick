@@ -153,13 +153,19 @@ void ParallelDimensionTickManager::workerLoop(DimensionWorkerContext* ctx) {
     strncpy_s(tl_currentPhase, "idle", _TRUNCATE);
 }
 
-// SEH 保护的核心 tick 函数 - 纯 C 风格，无 C++ 对象
+// SEH 保护的核心 tick 函数 - 添加指针验证
 static DWORD __stdcall tickDimensionCoreSafe(void* param) {
-    Dimension* dim = static_cast<Dimension*>(param);
     __try {
-        if (dim) {
-            dim->tick();
-        }
+        Dimension* dim = static_cast<Dimension*>(param);
+        // 验证指针：尝试读取虚函数表指针
+        if (!dim) return 0xC0000005;
+        
+        // 验证对象是否有效：读取第一个字段（虚函数表）
+        volatile void* vtable = *reinterpret_cast<void**>(dim);
+        if (!vtable) return 0xC0000005;
+        
+        // 执行 tick
+        dim->tick();
         return 0;
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -173,10 +179,6 @@ void ParallelDimensionTickManager::tickDimensionOnWorker(DimensionWorkerContext&
 
     strncpy_s(tl_currentPhase, "tick", _TRUNCATE);
     
-    // 保存当前阶段
-    char savedPhase[64];
-    strncpy_s(savedPhase, tl_currentPhase, _TRUNCATE);
-    
     // 调用 SEH 保护的函数
     DWORD exceptionCode = tickDimensionCoreSafe(ctx.dimensionPtr);
     
@@ -184,9 +186,13 @@ void ParallelDimensionTickManager::tickDimensionOnWorker(DimensionWorkerContext&
         mStats.totalSEHCaught.fetch_add(1, std::memory_order_relaxed);
         
         std::string phaseStr(tl_currentPhase);
-        // 修改这里：转换为 int
-        logger().error("SEH 异常 (代码: 0x{:X}) 发生在维度 {} 的 [{}] 阶段",
-            exceptionCode, tl_currentDimTypeId, phaseStr);
+        
+        if (exceptionCode == 0xC0000005) {
+            logger().error("维度 {} 访问违规（空指针或无效对象），切换到串行模式", tl_currentDimTypeId);
+        } else {
+            logger().error("SEH 异常 (代码: 0x{:X}) 发生在维度 {} 的 [{}] 阶段",
+                exceptionCode, tl_currentDimTypeId, phaseStr);
+        }
         
         // 只标记特定阶段为危险，不标记通用阶段
         if (phaseStr != "pre-tick" && 
@@ -215,7 +221,6 @@ void ParallelDimensionTickManager::tickDimensionOnWorker(DimensionWorkerContext&
 
     strncpy_s(tl_currentPhase, "idle", _TRUNCATE);
 }
-
 
 void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
     if (!level || !mInitialized) {
@@ -276,7 +281,7 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
         auto it = mContexts.find(dimId);
         if (it == mContexts.end()) {
             auto ctx = std::make_unique<DimensionWorkerContext>();
-            ctx->dimensionPtr = dim;
+            ctx->dimensionPtr = nullptr; // 初始化为空
             ctx->tickCompleted.store(false, std::memory_order_relaxed);
             ctx->isProcessing.store(false, std::memory_order_relaxed);
             ctx->tickFaulted.store(false, std::memory_order_relaxed);
@@ -287,16 +292,15 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
             ctx->totalSkippedTicks.store(0, std::memory_order_relaxed);
             ctx->workerThread = std::thread(&ParallelDimensionTickManager::workerLoop, this, ctx.get());
             mContexts[dimId] = std::move(ctx);
-        } else {
-            it->second->dimensionPtr = dim;
         }
     }
 
-    // 异步启动维度 tick
+    // 异步启动维度 tick - 不等待
     for (auto* dim : validDims) {
         int dimId = dim->getDimensionId();
         auto& ctx = *mContexts[dimId];
 
+        // 如果上一个 tick 还在处理，跳过这次
         if (ctx.isProcessing.load(std::memory_order_acquire)) {
             uint64_t skipped = ctx.skippedTicks.fetch_add(1, std::memory_order_relaxed) + 1;
             ctx.totalSkippedTicks.fetch_add(1, std::memory_order_relaxed);
@@ -314,6 +318,10 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
             logger().info("维度 {} 在跳过 {} 个 tick 后恢复", dimId, prevSkipped);
         }
 
+        // 设置维度指针并启动工作
+        ctx.dimensionPtr = dim;
+        std::atomic_thread_fence(std::memory_order_release); // 确保指针写入对工作线程可见
+        
         ctx.tickCompleted.store(false, std::memory_order_release);
         ctx.tickFaulted.store(false, std::memory_order_release);
         ctx.isProcessing.store(true, std::memory_order_release);
@@ -402,7 +410,6 @@ void ParallelDimensionTickManager::serialFallbackTick(const std::vector<Dimensio
             try {
                 dim->tick();
             } catch (...) {
-                // 修改这里：转换为 int
                 logger().error("串行 tick 维度 {} 时发生异常", static_cast<int>(dim->getDimensionId()));
             }
         }
