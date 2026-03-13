@@ -1,13 +1,10 @@
 #pragma once
-
 #include <ll/api/Config.h>
 #include <ll/api/io/Logger.h>
 #include <ll/api/mod/NativeMod.h>
-
 #include <mc/world/level/BlockPos.h>
 #include <mc/world/level/dimension/Dimension.h>
 #include <mc/network/Packet.h>
-
 #include <atomic>
 #include <condition_variable>
 #include <functional>
@@ -21,61 +18,55 @@
 namespace dim_parallel {
 
 struct Config {
-    int  version = 1;
+    int version = 1;
     bool enabled = true;
-    bool debug   = false;
+    bool debug = false;
 };
 
-Config&         getConfig();
-bool            loadConfig();
-bool            saveConfig();
+Config& getConfig();
+bool loadConfig();
+bool saveConfig();
 ll::io::Logger& logger();
 
 class MainThreadTaskQueue {
 public:
-    void   enqueue(std::function<void()> task);
-    void   processAll();
+    void enqueue(std::function<void()> task);
+    void processAll();
     size_t size() const;
-
 private:
-    mutable std::mutex                 mMutex;
+    mutable std::mutex mMutex;
     std::vector<std::function<void()>> mTasks;
     std::vector<std::function<void()>> mProcessing;
 };
 
 struct LevelTickSnapshot {
-    int  time      = 0;
+    int time = 0;
     bool simPaused = false;
 };
 
 struct DimensionWorkerContext {
-    WeakRef<Dimension>  dimensionRef;        // Use WeakRef for safety
-    uint64_t            lastTickTimeUs = 0;
-    MainThreadTaskQueue mainThreadTasks;     // Per-dimension task queue
-
-    // Per-dimension thread resources
-    std::thread                 workerThread;
-    std::mutex                  wakeMutex;
-    std::condition_variable     wakeCV;
-    bool                        shouldWork = false;
-    bool                        shutdown   = false;
-    std::atomic<bool>           tickCompleted{false};
+    Dimension* dimensionPtr = nullptr;          // ← 改为 raw pointer（本 tick 内安全）
+    uint64_t lastTickTimeUs = 0;
+    MainThreadTaskQueue mainThreadTasks;
+    std::thread workerThread;
+    std::mutex wakeMutex;
+    std::condition_variable wakeCV;
+    bool shouldWork = false;
+    bool shutdown = false;
+    std::atomic<bool> tickCompleted{false};
 };
 
 class ParallelDimensionTickManager {
 public:
     static ParallelDimensionTickManager& getInstance();
-
     void initialize();
     void shutdown();
     void dispatchAndSync(class Level* level);
-
-    static bool                    isWorkerThread();
+    static bool isWorkerThread();
     static DimensionWorkerContext* getCurrentContext();
-    static DimensionType           getCurrentDimensionType();
-    static void                    runOnMainThread(std::function<void()> task);
+    static DimensionType getCurrentDimensionType();
+    static void runOnMainThread(std::function<void()> task);
 
-    // Dangerous function management
     static void markFunctionDangerous(const std::string& funcName);
     static bool isFunctionDangerous(const std::string& funcName);
 
@@ -86,26 +77,24 @@ public:
         std::atomic<uint64_t> maxDimTickTimeUs{0};
         std::atomic<uint64_t> totalRecoveryAttempts{0};
         std::atomic<uint64_t> totalDangerousFunctions{0};
-        std::atomic<uint64_t> totalSkippedDimensions{0};   // Dimensions skipped due to invalid pointer
+        std::atomic<uint64_t> totalSkippedDimensions{0};
     };
     Stats& getStats() { return mStats; }
 
 private:
     ParallelDimensionTickManager() = default;
-
     void tickDimensionOnWorker(DimensionWorkerContext& ctx);
-    void serialFallbackTick(const std::vector<WeakRef<Dimension>>& dimensions);
+    void serialFallbackTick(const std::vector<Dimension*>& dimensions);
     void workerLoop(DimensionWorkerContext* ctx);
 
     std::unordered_map<int, std::unique_ptr<DimensionWorkerContext>> mContexts;
-    LevelTickSnapshot                               mSnapshot;
-    std::atomic<bool>                               mFallbackToSerial{false};
-    bool                                             mInitialized = false;
-    Stats                                            mStats;
+    LevelTickSnapshot mSnapshot;
+    std::atomic<bool> mFallbackToSerial{false};
+    bool mInitialized = false;
+    Stats mStats;
 
-    // Recovery mechanism
-    static constexpr uint64_t                        RECOVERY_INTERVAL_TICKS = 20; // 1 second at 20 tps
-    uint64_t                                          mFallbackStartTick = 0;
+    static constexpr uint64_t RECOVERY_INTERVAL_TICKS = 20;
+    uint64_t mFallbackStartTick = 0;
 };
 
 class PluginImpl {
@@ -116,7 +105,6 @@ public:
     bool load();
     bool enable();
     bool disable();
-
 private:
     ll::mod::NativeMod& mSelf;
 };
