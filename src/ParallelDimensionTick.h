@@ -44,8 +44,8 @@ private:
 };
 
 struct LevelTickSnapshot {
-    int  time      = 0;
-    bool simPaused = false;
+    int64_t time      = 0;
+    bool    simPaused = false;
 };
 
 struct DimensionWorkerContext {
@@ -65,18 +65,18 @@ private:
     void workerLoop();
 
     struct Batch {
-        std::function<void()>* tasks    = nullptr;
-        int                    count    = 0;
-        std::atomic<int>       nextIdx{0};
-        std::atomic<int>       doneCount{0};
+        std::vector<std::function<void()>>* tasks = nullptr;
+        std::atomic<int> nextIdx{0};
+        std::atomic<int> doneCount{0};
+        std::atomic<bool> completed{false};
     };
 
-    std::vector<std::thread>   mThreads;
-    std::mutex                 mMutex;
-    std::condition_variable    mWakeCV;
-    Batch                      mBatch;
-    uint64_t                   mGeneration = 0;
-    bool                       mShutdown   = false;
+    std::vector<std::thread>    mThreads;
+    std::mutex                  mMutex;
+    std::condition_variable     mWakeCV;
+    Batch                       mBatch;
+    std::atomic<uint64_t>       mGeneration{0};
+    std::atomic<bool>           mShutdown{false};
 };
 
 class ParallelDimensionTickManager {
@@ -108,6 +108,7 @@ private:
     void tickDimensionOnWorker(DimensionWorkerContext& ctx);
     void processAllMainThreadTasks();
     void serialFallbackTick(std::vector<Dimension*>& dimensions);
+    void handleTickException(int dimId);
 
     std::unordered_map<int, DimensionWorkerContext> mContexts;
     LevelTickSnapshot                               mSnapshot;
