@@ -33,6 +33,7 @@ public:
     void enqueue(std::function<void()> task);
     void processAll();
     size_t size() const;
+
 private:
     mutable std::mutex mMutex;
     std::vector<std::function<void()>> mTasks;
@@ -45,7 +46,7 @@ struct LevelTickSnapshot {
 };
 
 struct DimensionWorkerContext {
-    Dimension* dimensionPtr = nullptr;          // ← 改为 raw pointer（本 tick 内安全）
+    Dimension* dimensionPtr = nullptr; // raw pointer（本 tick 内安全）
     uint64_t lastTickTimeUs = 0;
     MainThreadTaskQueue mainThreadTasks;
     std::thread workerThread;
@@ -95,6 +96,10 @@ private:
 
     static constexpr uint64_t RECOVERY_INTERVAL_TICKS = 20;
     uint64_t mFallbackStartTick = 0;
+
+    // 修复：将危险函数集合提升为静态成员，确保所有实例共享
+    static std::unordered_set<std::string> m_dangerousFunctions;
+    static std::mutex m_dangerousMutex;
 };
 
 class PluginImpl {
@@ -105,6 +110,7 @@ public:
     bool load();
     bool enable();
     bool disable();
+
 private:
     ll::mod::NativeMod& mSelf;
 };
