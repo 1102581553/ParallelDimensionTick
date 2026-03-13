@@ -15,6 +15,7 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace dim_parallel {
@@ -23,7 +24,7 @@ struct Config {
     int  version = 1;
     bool enabled = true;
     bool debug   = false;
-    // Recovery interval is hardcoded to 1 second (20 ticks)
+    // Recovery interval hardcoded to 20 ticks (1 second)
 };
 
 Config&         getConfig();
@@ -74,12 +75,17 @@ public:
     static DimensionType           getCurrentDimensionType();
     static void                    runOnMainThread(std::function<void()> task);
 
+    // Record a function that caused an exception in worker thread
+    static void markFunctionDangerous(const std::string& funcName);
+    static bool isFunctionDangerous(const std::string& funcName);
+
     struct Stats {
         std::atomic<uint64_t> totalParallelTicks{0};
         std::atomic<uint64_t> totalFallbackTicks{0};
         std::atomic<uint64_t> totalMainThreadTasks{0};
         std::atomic<uint64_t> maxDimTickTimeUs{0};
         std::atomic<uint64_t> totalRecoveryAttempts{0};
+        std::atomic<uint64_t> totalDangerousFunctions{0};  // New statistic
     };
     Stats& getStats() { return mStats; }
 
@@ -90,7 +96,6 @@ private:
     void processAllMainThreadTasks();
     void serialFallbackTick(std::vector<Dimension*>& dimensions);
     void workerLoop(DimensionWorkerContext* ctx);
-    bool tryRecoverParallel(Level* level);
 
     std::unordered_map<int, std::unique_ptr<DimensionWorkerContext>> mContexts;
     LevelTickSnapshot                               mSnapshot;
@@ -98,7 +103,7 @@ private:
     bool                                             mInitialized = false;
     Stats                                            mStats;
 
-    // Global main thread task queue (merged) - now static to allow access from static methods
+    // Global main thread task queue (static for static method access)
     static MainThreadTaskQueue                       mMainThreadTasks;
 
     // Recovery mechanism
