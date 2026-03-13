@@ -48,7 +48,6 @@ public:
             std::lock_guard lock(mBufferMutex[readIdx]);
             tasks.swap(mBuffers[readIdx]);
         }
-
         for (auto& task : tasks) {
             task();
         }
@@ -84,7 +83,10 @@ struct DimensionWorkerContext {
     std::atomic<bool> shouldWork{false};
     std::atomic<bool> shutdown{false};
     std::atomic<bool> tickCompleted{false};
+    std::atomic<bool> isProcessing{false};
+    std::atomic<bool> tickFaulted{false};
     std::atomic<uint64_t> tickNumber{0};
+    std::atomic<uint64_t> skippedTicks{0};
     std::atomic<uint64_t> totalSkippedTicks{0};
 };
 
@@ -111,6 +113,8 @@ public:
         std::atomic<uint64_t> totalDangerousFunctions{0};
         std::atomic<uint64_t> totalSkippedDimensions{0};
         std::atomic<uint64_t> cycleMainThreadTasks{0};
+        std::atomic<uint64_t> totalTicksSkippedDueToBacklog{0};
+        std::atomic<uint64_t> totalSEHCaught{0};
     };
     Stats& getStats() { return mStats; }
 
@@ -127,7 +131,6 @@ private:
     Stats mStats;
 
     static constexpr uint64_t RECOVERY_INTERVAL_TICKS = 20;
-    static constexpr uint64_t WAIT_TIMEOUT_US = 100000; // 100ms 超时
     uint64_t mFallbackStartTick = 0;
 
     static std::unordered_set<std::string> m_dangerousFunctions;
