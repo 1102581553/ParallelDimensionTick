@@ -33,7 +33,7 @@ static std::atomic<bool> g_suppressDimensionTick{false};
 
 static std::vector<Dimension*> g_collectedDimensions;
 
-// 定义静态成员（在类外）
+// 定义静态成员
 std::unordered_set<std::string> ParallelDimensionTickManager::m_dangerousFunctions;
 std::mutex ParallelDimensionTickManager::m_dangerousMutex;
 
@@ -126,7 +126,6 @@ void ParallelDimensionTickManager::runOnMainThread(std::function<void()> task) {
     tl_currentContext->mainThreadTasks.enqueue(std::move(task));
 }
 
-// 修复后的危险函数标记
 void ParallelDimensionTickManager::markFunctionDangerous(const std::string& funcName) {
     std::lock_guard lock(m_dangerousMutex);
     if (m_dangerousFunctions.insert(funcName).second) {
@@ -135,7 +134,6 @@ void ParallelDimensionTickManager::markFunctionDangerous(const std::string& func
     }
 }
 
-// 修复后的危险函数检查
 bool ParallelDimensionTickManager::isFunctionDangerous(const std::string& funcName) {
     std::lock_guard lock(m_dangerousMutex);
     return m_dangerousFunctions.find(funcName) != m_dangerousFunctions.end();
@@ -259,7 +257,9 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
                 size_t taskCount = ctx.mainThreadTasks.size();
                 if (taskCount > 0) {
                     ctx.mainThreadTasks.processAll();
+                    // 累加累计计数和周期计数
                     mStats.totalMainThreadTasks += static_cast<uint64_t>(taskCount);
+                    mStats.cycleMainThreadTasks += static_cast<uint64_t>(taskCount);
                 }
                 bool expected = true;
                 if (ctx.tickCompleted.compare_exchange_strong(expected, false)) {
@@ -279,11 +279,13 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
     mStats.totalParallelTicks++;
 
     if (config.debug && (mStats.totalParallelTicks % 200 == 0)) {
+        // 获取并重置周期计数器
+        uint64_t cycleTasks = mStats.cycleMainThreadTasks.exchange(0);
         logger().info(
             "Parallel tick #{}: dims={} mainTasks={} fallbacks={} dangerous={} recoveryAttempts={} skipped={}",
             mStats.totalParallelTicks.load(),
             validDims.size(),
-            mStats.totalMainThreadTasks.load(),
+            cycleTasks,  // 显示周期内的任务数
             mStats.totalFallbackTicks.load(),
             mStats.totalDangerousFunctions.load(),
             mStats.totalRecoveryAttempts.load(),
