@@ -14,6 +14,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <string>
 
 namespace dim_parallel {
 
@@ -49,7 +50,11 @@ public:
             tasks.swap(mBuffers[readIdx]);
         }
         for (auto& task : tasks) {
-            task();
+            try {
+                task();
+            } catch (...) {
+                logger().error("主线程任务执行异常");
+            }
         }
     }
 
@@ -90,6 +95,12 @@ struct DimensionWorkerContext {
     std::atomic<uint64_t> totalSkippedTicks{0};
 };
 
+struct TickResult {
+    DWORD exceptionCode;
+    bool success;
+    std::string phase;
+};
+
 class ParallelDimensionTickManager {
 public:
     static ParallelDimensionTickManager& getInstance();
@@ -118,11 +129,12 @@ public:
     };
     Stats& getStats() { return mStats; }
 
+    void workerLoop(DimensionWorkerContext* ctx);
+
 private:
     ParallelDimensionTickManager() = default;
     void tickDimensionOnWorker(DimensionWorkerContext& ctx);
     void serialFallbackTick(const std::vector<Dimension*>& dimensions);
-    void workerLoop(DimensionWorkerContext* ctx);
 
     std::unordered_map<int, std::unique_ptr<DimensionWorkerContext>> mContexts;
     LevelTickSnapshot mSnapshot;
