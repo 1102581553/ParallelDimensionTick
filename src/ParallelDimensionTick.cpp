@@ -23,7 +23,7 @@ static Config config;
 static std::shared_ptr<ll::io::Logger> log;
 static bool hookInstalled = false;
 
-static thread_local DimensionWorkerContext* tl_currentContext = nullptr;
+static thread_local DimensionFiberContext* tl_currentContext = nullptr;
 static thread_local bool tl_isWorkerThread = false;
 static thread_local int tl_currentDimTypeId = -1;
 static thread_local char tl_currentPhase[64] = "idle";
@@ -57,66 +57,6 @@ bool saveConfig() {
 }
 
 //=============================================================================
-// TLS 复制实现
-//=============================================================================
-
-static inline void* getTEB() {
-    return reinterpret_cast<void*>(__readgsqword(0x30));
-}
-
-bool TlsCloner::captureMainThread() {
-    void* teb = getTEB();
-    if (!teb) return false;
-
-    char* tebBase = static_cast<char*>(teb);
-
-    // 读取 ThreadLocalStoragePointer
-    mMainTlsPointer = *reinterpret_cast<void**>(tebBase + TEB_TLS_POINTER_OFFSET);
-
-    // 读取 TlsSlots[64]
-    memcpy(mMainTlsSlots, tebBase + TEB_TLS_SLOTS_OFFSET, sizeof(void*) * TEB_TLS_SLOTS_COUNT);
-
-    // 读取 TlsExpansionSlots
-    mMainTlsExpansion = *reinterpret_cast<void**>(tebBase + TEB_TLS_EXPANSION_OFFSET);
-
-    mCaptured = true;
-    return true;
-}
-
-bool TlsCloner::applyToCurrentThread() {
-    if (!mCaptured) return false;
-
-    void* teb = getTEB();
-    if (!teb) return false;
-
-    char* tebBase = static_cast<char*>(teb);
-
-    // 保存当前线程的原始 TLS
-    mSavedTlsPointer = *reinterpret_cast<void**>(tebBase + TEB_TLS_POINTER_OFFSET);
-    memcpy(mSavedTlsSlots, tebBase + TEB_TLS_SLOTS_OFFSET, sizeof(void*) * TEB_TLS_SLOTS_COUNT);
-    mSavedTlsExpansion = *reinterpret_cast<void**>(tebBase + TEB_TLS_EXPANSION_OFFSET);
-
-    // 覆盖为主线程的 TLS
-    *reinterpret_cast<void**>(tebBase + TEB_TLS_POINTER_OFFSET) = mMainTlsPointer;
-    memcpy(tebBase + TEB_TLS_SLOTS_OFFSET, mMainTlsSlots, sizeof(void*) * TEB_TLS_SLOTS_COUNT);
-    *reinterpret_cast<void**>(tebBase + TEB_TLS_EXPANSION_OFFSET) = mMainTlsExpansion;
-
-    return true;
-}
-
-void TlsCloner::restoreCurrentThread() {
-    void* teb = getTEB();
-    if (!teb) return;
-
-    char* tebBase = static_cast<char*>(teb);
-
-    // 恢复原始 TLS
-    *reinterpret_cast<void**>(tebBase + TEB_TLS_POINTER_OFFSET) = mSavedTlsPointer;
-    memcpy(tebBase + TEB_TLS_SLOTS_OFFSET, mSavedTlsSlots, sizeof(void*) * TEB_TLS_SLOTS_COUNT);
-    *reinterpret_cast<void**>(tebBase + TEB_TLS_EXPANSION_OFFSET) = mSavedTlsExpansion;
-}
-
-//=============================================================================
 // ParallelDimensionTickManager
 //=============================================================================
 
@@ -130,19 +70,13 @@ void ParallelDimensionTickManager::initialize() {
     mFallbackToSerial = false;
     mFallbackStartTick = 0;
 
-    // 自动计算工作线程数 = CPU核心数 - 1
     SYSTEM_INFO sysInfo;
     GetSystemInfo(&sysInfo);
     mWorkerCount = static_cast<int>(sysInfo.dwNumberOfProcessors) - 1;
     if (mWorkerCount < 1) mWorkerCount = 1;
 
-    // 在主线程捕获 TLS 快照
-    if (!mMainTlsSnapshot.captureMainThread()) {
-        logger().error("捕获主线程 TLS 失败");
-    }
-
     mInitialized = true;
-    logger().info("已初始化 TLS 克隆并行模型（CPU: {}, 工作线程: {}）",
+    logger().info("已初始化 Fiber-per-Thread 并行模型（CPU: {}, 工作线程: {}）",
         sysInfo.dwNumberOfProcessors, mWorkerCount);
 }
 
@@ -151,11 +85,12 @@ void ParallelDimensionTickManager::shutdown() {
     for (auto& [id, ctx] : mContexts) {
         ctx->shutdown.store(true, std::memory_order_release);
         ctx->wakeCV.notify_one();
-        if (ctx->threadHandle) {
-            WaitForSingleObject(ctx->threadHandle, 5000);
-            CloseHandle(ctx->threadHandle);
-            ctx->threadHandle = nullptr;
+        if (ctx->workerThread) {
+            WaitForSingleObject(ctx->workerThread, 5000);
+            CloseHandle(ctx->workerThread);
+            ctx->workerThread = nullptr;
         }
+        // fiber 由工作线程创建和销毁，这里不需要处理
     }
     mContexts.clear();
     mInitialized = false;
@@ -164,7 +99,7 @@ void ParallelDimensionTickManager::shutdown() {
 
 bool ParallelDimensionTickManager::isWorkerThread() { return tl_isWorkerThread; }
 
-DimensionWorkerContext* ParallelDimensionTickManager::getCurrentContext() { return tl_currentContext; }
+DimensionFiberContext* ParallelDimensionTickManager::getCurrentContext() { return tl_currentContext; }
 
 void ParallelDimensionTickManager::runOnMainThread(std::function<void()> task) {
     if (!tl_isWorkerThread || !tl_currentContext) {
@@ -188,64 +123,14 @@ bool ParallelDimensionTickManager::isFunctionDangerous(const std::string& funcNa
 }
 
 //=============================================================================
-// 工作线程
+// SEH 包装
 //=============================================================================
 
-DWORD WINAPI ParallelDimensionTickManager::workerThreadProc(LPVOID param) {
-    auto* ctx = static_cast<DimensionWorkerContext*>(param);
-
-    tl_isWorkerThread = true;
-    tl_currentContext = ctx;
-    tl_currentDimTypeId = -1;
-
-    while (true) {
-        std::unique_lock lock(ctx->wakeMutex);
-        ctx->wakeCV.wait(lock, [ctx] {
-            return ctx->shouldWork.load(std::memory_order_acquire) ||
-                   ctx->shutdown.load(std::memory_order_acquire);
-        });
-
-        if (ctx->shutdown.load(std::memory_order_acquire)) break;
-
-        ctx->shouldWork.store(false, std::memory_order_release);
-        lock.unlock();
-
-        std::atomic_thread_fence(std::memory_order_acquire);
-
-        if (ctx->dimensionPtr) {
-            tl_currentDimTypeId = ctx->dimensionPtr->getDimensionId();
-        }
-        tl_currentContext = ctx;
-
-        if (ctx->dimensionPtr) {
-            // 应用主线程 TLS
-            ctx->tlsCloner.applyToCurrentThread();
-
-            getInstance().tickDimensionOnWorker(*ctx);
-
-            // 恢复原始 TLS
-            ctx->tlsCloner.restoreCurrentThread();
-        }
-
-        ctx->isProcessing.store(false, std::memory_order_release);
-        ctx->tickCompleted.store(true, std::memory_order_release);
-    }
-
-    tl_isWorkerThread = false;
-    tl_currentContext = nullptr;
-    tl_currentDimTypeId = -1;
-    strncpy_s(tl_currentPhase, "idle", _TRUNCATE);
-    return 0;
-}
-
-// SEH 保护
-static DWORD __stdcall tickDimensionCoreSafe(void* param) {
+static DWORD executeDimTickSafe(Dimension* dim) {
     __try {
-        Dimension* dim = static_cast<Dimension*>(param);
-        if (!dim) return 0xC0000005;
-        volatile void* vtable = *reinterpret_cast<void**>(dim);
-        if (!vtable) return 0xC0000005;
-        dim->tick();
+        if (dim) {
+            dim->tick();
+        }
         return 0;
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -253,51 +138,168 @@ static DWORD __stdcall tickDimensionCoreSafe(void* param) {
     }
 }
 
-void ParallelDimensionTickManager::tickDimensionOnWorker(DimensionWorkerContext& ctx) {
-    strncpy_s(tl_currentPhase, "pre-tick", _TRUNCATE);
-    auto start = std::chrono::steady_clock::now();
+//=============================================================================
+// 维度 Fiber 入口
+//=============================================================================
 
-    strncpy_s(tl_currentPhase, "tick", _TRUNCATE);
+void CALLBACK ParallelDimensionTickManager::dimFiberProc(LPVOID param) {
+    auto* ctx = static_cast<DimensionFiberContext*>(param);
 
-    DWORD exceptionCode = tickDimensionCoreSafe(ctx.dimensionPtr);
+    // fiber 循环：每次被切换进来执行一次 tick，然后切回工作线程 fiber
+    while (true) {
+        ctx->tickDone = false;
+        ctx->faulted = false;
+        ctx->exceptionCode = 0;
 
-    if (exceptionCode != 0) {
-        mStats.totalSEHCaught.fetch_add(1, std::memory_order_relaxed);
+        if (ctx->dimensionPtr) {
+            auto start = std::chrono::steady_clock::now();
 
-        std::string phaseStr(tl_currentPhase);
+            DWORD code = executeDimTickSafe(ctx->dimensionPtr);
 
-        if (exceptionCode == 0xC0000409) {
-            logger().error("维度 {} GS cookie 失败 (0xC0000409)，TLS 克隆可能不完整，切换串行", ctx.dimId);
-        } else if (exceptionCode == 0xC0000005) {
-            logger().error("维度 {} 访问违规，切换串行", ctx.dimId);
-        } else {
-            logger().error("SEH 异常 (代码: 0x{:X}) 维度 {} [{}]", exceptionCode, ctx.dimId, phaseStr);
+            auto end = std::chrono::steady_clock::now();
+            ctx->lastTickTimeUs =
+                std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+
+            if (code != 0) {
+                ctx->faulted = true;
+                ctx->exceptionCode = code;
+            }
         }
 
-        if (phaseStr != "pre-tick" && phaseStr != "post-tick" &&
-            phaseStr != "idle" && phaseStr != "tick") {
-            markFunctionDangerous(phaseStr);
+        ctx->tickDone = true;
+
+        // 切回工作线程的主 fiber
+        // 工作线程在 ConvertThreadToFiber 后得到的 fiber
+        void* workerFiber = GetCurrentFiber();
+        // 不能切回自己，需要一个外部存储的 caller fiber
+        // 我们用 tl_currentContext 中不存在的字段...
+        // 实际上 fiber 切换需要知道切回哪里
+        // 解决方案：在 ctx 中存储 workerMainFiber
+        // 但这里 dimFiberProc 是 fiber 入口，第一次进来时还没有设置
+        // 所以我们需要在 workerThreadProc 中设置后再切换
+
+        // 这里直接用 SwitchToFiber 切回，workerMainFiber 在 ctx 中
+        // 需要在 header 中添加字段... 但为了不改 header，用 thread_local
+        // 不行，fiber 不等于 thread_local
+        // 最简单：在 DimensionFiberContext 中加一个 callerFiber 字段
+        // header 中已经没有了，需要加回来
+
+        // 暂时用一个全局 thread_local
+        // fiber 运行在哪个线程上，thread_local 就是那个线程的
+        // 这是安全的
+        extern thread_local void* tl_workerMainFiber;
+        if (tl_workerMainFiber) {
+            SwitchToFiber(tl_workerMainFiber);
         }
-
-        ctx.tickFaulted.store(true, std::memory_order_release);
-        mFallbackToSerial.store(true, std::memory_order_relaxed);
-
-        strncpy_s(tl_currentPhase, "idle", _TRUNCATE);
-        return;
+        // 如果切回失败，fiber 会在这里死循环等待下次切入
     }
-
-    strncpy_s(tl_currentPhase, "post-tick", _TRUNCATE);
-    auto end = std::chrono::steady_clock::now();
-    ctx.lastTickTimeUs = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-
-    uint64_t expected = mStats.maxDimTickTimeUs.load(std::memory_order_relaxed);
-    while (ctx.lastTickTimeUs > expected) {
-        if (mStats.maxDimTickTimeUs.compare_exchange_weak(expected, ctx.lastTickTimeUs,
-            std::memory_order_relaxed, std::memory_order_relaxed)) break;
-    }
-
-    strncpy_s(tl_currentPhase, "idle", _TRUNCATE);
 }
+
+//=============================================================================
+// 工作线程：每个维度一个线程，线程内用 fiber 执行 tick
+//=============================================================================
+
+thread_local void* tl_workerMainFiber = nullptr;
+
+DWORD WINAPI ParallelDimensionTickManager::workerThreadProc(LPVOID param) {
+    auto* ctx = static_cast<DimensionFiberContext*>(param);
+
+    tl_isWorkerThread = true;
+    tl_currentContext = ctx;
+    tl_currentDimTypeId = ctx->dimId;
+
+    // 将工作线程转换为 fiber
+    tl_workerMainFiber = ConvertThreadToFiber(nullptr);
+    if (!tl_workerMainFiber) {
+        logger().error("维度 {} 工作线程 ConvertThreadToFiber 失败 (错误: {})",
+            ctx->dimId, GetLastError());
+        return 1;
+    }
+
+    // 创建维度 tick fiber（8MB 栈）
+    ctx->dimFiber = CreateFiber(
+        8 * 1024 * 1024,
+        &ParallelDimensionTickManager::dimFiberProc,
+        ctx
+    );
+
+    if (!ctx->dimFiber) {
+        logger().error("维度 {} CreateFiber 失败 (错误: {})", ctx->dimId, GetLastError());
+        ConvertFiberToThread();
+        return 1;
+    }
+
+    logger().info("维度 {} fiber 工作线程就绪", ctx->dimId);
+
+    while (true) {
+        // 等待调度信号
+        {
+            std::unique_lock lock(ctx->wakeMutex);
+            ctx->wakeCV.wait(lock, [ctx] {
+                return ctx->shouldWork.load(std::memory_order_acquire) ||
+                       ctx->shutdown.load(std::memory_order_acquire);
+            });
+        }
+
+        if (ctx->shutdown.load(std::memory_order_acquire)) break;
+
+        ctx->shouldWork.store(false, std::memory_order_release);
+
+        std::atomic_thread_fence(std::memory_order_acquire);
+
+        if (ctx->dimensionPtr && ctx->dimFiber) {
+            tl_currentDimTypeId = ctx->dimensionPtr->getDimensionId();
+            strncpy_s(tl_currentPhase, "tick", _TRUNCATE);
+
+            // 切换到维度 fiber 执行 tick
+            SwitchToFiber(ctx->dimFiber);
+
+            // tick 完成，回到这里
+            strncpy_s(tl_currentPhase, "idle", _TRUNCATE);
+
+            if (ctx->faulted) {
+                getInstance().mStats.totalSEHCaught.fetch_add(1, std::memory_order_relaxed);
+
+                if (ctx->exceptionCode == 0xC0000409) {
+                    logger().error("维度 {} GS cookie 失败，销毁 fiber", ctx->dimId);
+                } else if (ctx->exceptionCode == 0xC0000005) {
+                    logger().error("维度 {} 访问违规 (0x{:X})", ctx->dimId, ctx->exceptionCode);
+                } else {
+                    logger().error("维度 {} SEH 异常 (0x{:X})", ctx->dimId, ctx->exceptionCode);
+                }
+
+                // 销毁出错的 fiber，下次重建
+                DeleteFiber(ctx->dimFiber);
+                ctx->dimFiber = CreateFiber(
+                    8 * 1024 * 1024,
+                    &ParallelDimensionTickManager::dimFiberProc,
+                    ctx
+                );
+
+                getInstance().mFallbackToSerial.store(true, std::memory_order_relaxed);
+            }
+        }
+
+        ctx->isProcessing.store(false, std::memory_order_release);
+        ctx->tickCompleted.store(true, std::memory_order_release);
+    }
+
+    // 清理
+    if (ctx->dimFiber) {
+        DeleteFiber(ctx->dimFiber);
+        ctx->dimFiber = nullptr;
+    }
+    ConvertFiberToThread();
+
+    tl_isWorkerThread = false;
+    tl_currentContext = nullptr;
+    tl_workerMainFiber = nullptr;
+    return 0;
+}
+
+//=============================================================================
+// 调度
+//=============================================================================
 
 void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
     if (!level || !mInitialized) {
@@ -311,9 +313,6 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
     }
 
     if (level->getSimPaused()) return;
-
-    // 每次 tick 刷新主线程 TLS 快照
-    mMainTlsSnapshot.captureMainThread();
 
     std::vector<Dimension*> dimRefs;
     {
@@ -355,44 +354,36 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
     }
 
     // 确保每个维度有工作线程
-    SIZE_T stackSize = 8 * 1024 * 1024; // 8MB
     for (auto* dim : validDims) {
         int dimId = dim->getDimensionId();
         auto it = mContexts.find(dimId);
         if (it == mContexts.end()) {
-            auto ctx = std::make_unique<DimensionWorkerContext>();
+            auto ctx = std::make_unique<DimensionFiberContext>();
             ctx->dimId = dimId;
             ctx->dimensionPtr = nullptr;
             ctx->tickCompleted.store(false, std::memory_order_relaxed);
             ctx->isProcessing.store(false, std::memory_order_relaxed);
-            ctx->tickFaulted.store(false, std::memory_order_relaxed);
             ctx->shutdown.store(false, std::memory_order_relaxed);
             ctx->shouldWork.store(false, std::memory_order_relaxed);
             ctx->tickNumber.store(0, std::memory_order_relaxed);
             ctx->skippedTicks.store(0, std::memory_order_relaxed);
             ctx->totalSkippedTicks.store(0, std::memory_order_relaxed);
 
-            // 复制主线程 TLS 快照到 worker 的 cloner
-            ctx->tlsCloner = mMainTlsSnapshot;
-
-            ctx->threadHandle = CreateThread(
-                nullptr, stackSize,
+            ctx->workerThread = CreateThread(
+                nullptr,
+                0, // 默认栈，fiber 有自己的栈
                 &ParallelDimensionTickManager::workerThreadProc,
                 ctx.get(),
-                STACK_SIZE_PARAM_IS_A_RESERVATION,
+                0,
                 nullptr
             );
 
-            if (!ctx->threadHandle) {
+            if (!ctx->workerThread) {
                 logger().error("创建维度 {} 工作线程失败 (错误: {})", dimId, GetLastError());
                 continue;
             }
 
-            logger().info("维度 {} 工作线程已创建（TLS 克隆, 栈: 8MB）", dimId);
             mContexts[dimId] = std::move(ctx);
-        } else {
-            // 每次 tick 更新 TLS 快照
-            it->second->tlsCloner = mMainTlsSnapshot;
         }
     }
 
@@ -424,7 +415,6 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
         std::atomic_thread_fence(std::memory_order_release);
 
         ctx.tickCompleted.store(false, std::memory_order_release);
-        ctx.tickFaulted.store(false, std::memory_order_release);
         ctx.isProcessing.store(true, std::memory_order_release);
         ctx.tickNumber.fetch_add(1, std::memory_order_relaxed);
 
@@ -448,14 +438,14 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
             }
             ctx.tickCompleted.store(false, std::memory_order_release);
 
-            if (ctx.tickFaulted.load(std::memory_order_acquire)) {
+            if (ctx.faulted) {
                 logger().warn("维度 {} 出错，运行串行恢复 tick", dimId);
                 try {
                     dim->tick();
                 } catch (...) {
                     logger().error("维度 {} 恢复 tick 也失败了", dimId);
                 }
-                ctx.tickFaulted.store(false, std::memory_order_release);
+                ctx.faulted = false;
             }
         }
     }
@@ -474,14 +464,13 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
     if (config.debug && (mStats.totalParallelTicks.load(std::memory_order_relaxed) % 200 == 0)) {
         uint64_t cycleTasks = mStats.cycleMainThreadTasks.exchange(0, std::memory_order_relaxed);
         logger().info(
-            "并行 tick #{}: dims={} mainTasks={} skippedTotal={} sehCaught={} fallbacks={} dangerous={} recovery={}",
+            "并行 tick #{}: dims={} mainTasks={} skippedTotal={} sehCaught={} fallbacks={} recovery={}",
             mStats.totalParallelTicks.load(std::memory_order_relaxed),
             validDims.size(),
             cycleTasks,
             mStats.totalTicksSkippedDueToBacklog.load(std::memory_order_relaxed),
             mStats.totalSEHCaught.load(std::memory_order_relaxed),
             mStats.totalFallbackTicks.load(std::memory_order_relaxed),
-            mStats.totalDangerousFunctions.load(std::memory_order_relaxed),
             mStats.totalRecoveryAttempts.load(std::memory_order_relaxed)
         );
         for (auto* dim : validDims) {
@@ -489,10 +478,11 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
             auto ctxIt = mContexts.find(dimId);
             if (ctxIt == mContexts.end()) continue;
             auto& ctx = *ctxIt->second;
-            logger().info(" dim[{}]: {}us (tick #{}, skipped: {})",
+            logger().info(" dim[{}]: {}us (tick #{}, skipped: {}, fiber: {})",
                 dimId, ctx.lastTickTimeUs,
                 ctx.tickNumber.load(std::memory_order_relaxed),
-                ctx.totalSkippedTicks.load(std::memory_order_relaxed));
+                ctx.totalSkippedTicks.load(std::memory_order_relaxed),
+                ctx.dimFiber ? "ok" : "destroyed");
         }
 
         std::lock_guard lock(m_dangerousMutex);
@@ -545,56 +535,6 @@ inline void handleDangerousFunction(const char* funcName, Func&& func, Args&&...
 //=============================================================================
 // Hooks
 //=============================================================================
-
-LL_TYPE_INSTANCE_HOOK(
-    LevelTickHook,
-    ll::memory::HookPriority::Normal,
-    Level,
-    &Level::$tick,
-    void
-) {
-    static thread_local bool inHook = false;
-    if (!config.enabled) {
-        origin();
-        return;
-    }
-    if (inHook) {
-        origin();
-        return;
-    }
-    inHook = true;
-
-    {
-        std::lock_guard<std::mutex> lock(g_dimensionCollectionMutex);
-        g_collectedDimensions.clear();
-    }
-
-    g_suppressDimensionTick.store(true, std::memory_order_release);
-
-    this->forEachDimension([&](Dimension& dim) -> bool {
-        std::lock_guard<std::mutex> lock(g_dimensionCollectionMutex);
-        g_collectedDimensions.emplace_back(&dim);
-        return true;
-    });
-
-    origin();
-
-    g_suppressDimensionTick.store(false, std::memory_order_release);
-
-    bool hasDimensions = false;
-    {
-        std::lock_guard<std::mutex> lock(g_dimensionCollectionMutex);
-        hasDimensions = !g_collectedDimensions.empty();
-    }
-
-    if (hasDimensions) {
-        g_inParallelPhase.store(true, std::memory_order_release);
-        ParallelDimensionTickManager::getInstance().dispatchAndSync(this);
-        g_inParallelPhase.store(false, std::memory_order_release);
-    }
-
-    inHook = false;
-}
 
 LL_TYPE_INSTANCE_HOOK(
     DimensionTickHook,
