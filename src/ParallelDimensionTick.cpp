@@ -34,7 +34,7 @@ static thread_local const char*            tl_currentPhase     = "idle";
 static std::atomic<bool>       g_inParallelPhase{false};
 static std::atomic<bool>       g_suppressDimensionTick{false};
 
-// Collection of dimensions for parallel tick - now using WeakRef
+// Collection of dimensions for parallel tick - using WeakRef
 static std::vector<WeakRef<Dimension>> g_collectedDimensions;
 static std::mutex                       g_collectMutex;
 
@@ -146,8 +146,9 @@ bool ParallelDimensionTickManager::isFunctionDangerous(const std::string& funcNa
 void ParallelDimensionTickManager::workerLoop(DimensionWorkerContext* ctx) {
     tl_isWorkerThread  = true;
     tl_currentContext  = ctx;
-    if (ctx->dimensionRef.isValid()) {
-        tl_currentDimTypeId = ctx->dimensionRef->getDimensionId();
+    // Get dimension ID via lock()
+    if (auto dimPtr = ctx->dimensionRef.lock()) {
+        tl_currentDimTypeId = dimPtr->getDimensionId();
     } else {
         tl_currentDimTypeId = -1;
     }
@@ -159,7 +160,7 @@ void ParallelDimensionTickManager::workerLoop(DimensionWorkerContext* ctx) {
         ctx->shouldWork = false;
         lock.unlock();
 
-        if (ctx->dimensionRef.isValid()) {
+        if (auto dimPtr = ctx->dimensionRef.lock()) {
             tickDimensionOnWorker(*ctx);
         } else {
             logger().error("Dimension worker: dimension is no longer valid, skipping tick");
@@ -177,7 +178,7 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
         // Fallback: collect dimensions directly and tick serially
         std::vector<WeakRef<Dimension>> dimRefs;
         level->forEachDimension([&](Dimension& dim) -> bool {
-            dimRefs.emplace_back(dim);
+            dimRefs.emplace_back(WeakRef<Dimension>(dim));
             return true;
         });
         serialFallbackTick(dimRefs);
@@ -191,11 +192,20 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
     auto& dimRefs = g_collectedDimensions;
     if (dimRefs.empty()) return;
 
-    // If only one valid dimension, tick it directly
-    if (dimRefs.size() == 1) {
-        if (auto dim = dimRefs[0].tryUnwrap()) {
-            dim->tick();
+    // Build list of valid dimensions
+    std::vector<Dimension*> validDims;
+    for (auto& ref : dimRefs) {
+        if (auto dimPtr = ref.lock()) {
+            validDims.push_back(dimPtr.get()); // Assuming lock() returns a pointer-like object with get()
+        } else {
+            logger().debug("Skipping invalid dimension reference during parallel tick");
+            mStats.totalSkippedDimensions++;
         }
+    }
+
+    if (validDims.empty()) return;
+    if (validDims.size() == 1) {
+        validDims[0]->tick();
         return;
     }
 
@@ -212,39 +222,21 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
         }
     }
 
-    // Build list of valid dimensions and ensure each has a worker thread
-    std::vector<Dimension*> validDims;
-    for (auto& ref : dimRefs) {
-        if (auto dim = ref.tryUnwrap()) {
-            validDims.push_back(dim.get());
-        } else {
-            logger().debug("Skipping invalid dimension reference during parallel tick");
-            mStats.totalSkippedDimensions++;
-        }
-    }
-
-    if (validDims.empty()) return;
-    if (validDims.size() == 1) {
-        validDims[0]->tick();
-        return;
-    }
-
-    // Ensure worker threads exist for each dimension
+    // Ensure worker threads exist for each valid dimension
     for (auto* dim : validDims) {
         int dimId = dim->getDimensionId();
         auto it = mContexts.find(dimId);
         if (it == mContexts.end()) {
             auto ctx = std::make_unique<DimensionWorkerContext>();
-            ctx->dimensionRef = *dim;   // WeakRef from Dimension&
+            ctx->dimensionRef = WeakRef<Dimension>(*dim); // Construct WeakRef from Dimension&
             ctx->tickCompleted = false;
             ctx->shutdown = false;
             ctx->shouldWork = false;
             ctx->workerThread = std::thread(&ParallelDimensionTickManager::workerLoop, this, ctx.get());
             mContexts[dimId] = std::move(ctx);
-            it = mContexts.find(dimId);
         } else {
-            // Update the WeakRef (dimension object might have been recreated? unlikely, but safe)
-            it->second->dimensionRef = *dim;
+            // Update the WeakRef (in case dimension object changed)
+            it->second->dimensionRef = WeakRef<Dimension>(*dim);
         }
     }
 
@@ -270,7 +262,7 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
                 size_t taskCount = ctx->mainThreadTasks.size();
                 if (taskCount > 0) {
                     ctx->mainThreadTasks.processAll();
-                    mStats.totalMainThreadTasks += taskCount;
+                    mStats.totalMainThreadTasks += static_cast<uint64_t>(taskCount);
                 }
                 bool expected = true;
                 if (ctx->tickCompleted.compare_exchange_strong(expected, false)) {
@@ -311,8 +303,8 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
 void ParallelDimensionTickManager::tickDimensionOnWorker(DimensionWorkerContext& ctx) {
     tl_isWorkerThread  = true;
     tl_currentContext   = &ctx;
-    if (ctx.dimensionRef.isValid()) {
-        tl_currentDimTypeId = ctx.dimensionRef->getDimensionId();
+    if (auto dimPtr = ctx.dimensionRef.lock()) {
+        tl_currentDimTypeId = dimPtr->getDimensionId();
     } else {
         tl_currentDimTypeId = -1;
     }
@@ -322,8 +314,8 @@ void ParallelDimensionTickManager::tickDimensionOnWorker(DimensionWorkerContext&
 
     try {
         tl_currentPhase = "tick";
-        if (auto dim = ctx.dimensionRef.tryUnwrap()) {
-            dim->tick();
+        if (auto dimPtr = ctx.dimensionRef.lock()) {
+            dimPtr->tick();
         }
         tl_currentPhase = "post-tick";
     } catch (std::exception& e) {
@@ -358,8 +350,8 @@ void ParallelDimensionTickManager::tickDimensionOnWorker(DimensionWorkerContext&
 
 void ParallelDimensionTickManager::serialFallbackTick(const std::vector<WeakRef<Dimension>>& dimRefs) {
     for (auto& ref : dimRefs) {
-        if (auto dim = ref.tryUnwrap()) {
-            dim->tick();
+        if (auto dimPtr = ref.lock()) {
+            dimPtr->tick();
         }
     }
     mStats.totalFallbackTicks++;
@@ -442,7 +434,7 @@ LL_TYPE_INSTANCE_HOOK(
     }
     if (g_suppressDimensionTick.load(std::memory_order_acquire)) {
         std::lock_guard lock(g_collectMutex);
-        g_collectedDimensions.emplace_back(*this);  // Store WeakRef
+        g_collectedDimensions.emplace_back(WeakRef<Dimension>(*this));
         return;
     }
     if (g_inParallelPhase.load(std::memory_order_acquire)) {
