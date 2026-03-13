@@ -19,6 +19,10 @@
 #include <vector>
 #include <queue>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 namespace dim_parallel {
 
 struct Config {
@@ -61,7 +65,8 @@ struct DimensionWorkerContext {
     std::thread         workerThread;
     std::queue<std::function<void()>> taskQueue;
     std::mutex          queueMutex;
-    std::condition_variable taskCV;
+    std::condition_variable taskCV;      // 任务队列通知
+    std::condition_variable completionCV; // 完成通知
     std::atomic<bool>   shouldStop{false};
     std::atomic<bool>   isWorking{false};
     std::atomic<bool>   hasPendingWork{false};
@@ -75,7 +80,7 @@ struct DimensionWorkerContext {
             workerThread = std::thread([this]() {
                 #ifdef _WIN32
                 wchar_t name[64];
-                swprintf(name, L"Dim_%d_Thread", 
+                swprintf_s(name, L"Dim_%d_Thread", 
                          this->dimension ? this->dimension->getDimensionId() : -1);
                 SetThreadDescription(GetCurrentThread(), name);
                 #endif
@@ -112,6 +117,9 @@ struct DimensionWorkerContext {
                                          dimension ? dimension->getDimensionId() : -1);
                         }
                         isWorking.store(false, std::memory_order_release);
+                        
+                        // 通知任务完成
+                        completionCV.notify_all();
                     }
                 }
             });
@@ -131,7 +139,7 @@ struct DimensionWorkerContext {
     // 等待当前任务完成
     void waitForCompletion() {
         std::unique_lock lock(queueMutex);
-        taskCV.wait(lock, [this] { 
+        completionCV.wait(lock, [this] { 
             return !hasPendingWork.load(std::memory_order_acquire) && 
                    !isWorking.load(std::memory_order_acquire); 
         });
@@ -141,6 +149,7 @@ struct DimensionWorkerContext {
     void shutdown() {
         shouldStop.store(true, std::memory_order_release);
         taskCV.notify_all();
+        completionCV.notify_all();
         
         if (workerThread.joinable()) {
             workerThread.join();
@@ -148,9 +157,7 @@ struct DimensionWorkerContext {
     }
 };
 
-class ParallelDimensionTickManager {
-public:
-    static ParallelDimensionTickManager& getInstance();
+class ParallelDimensionTickManager static ParallelDimensionTickManager& getInstance();
 
     void initialize();
     void shutdown();
@@ -158,7 +165,7 @@ public:
 
     static bool                    isWorkerThread();
     static DimensionWorkerContext* getCurrentContext();
-    static DimensionType           getCurrentDimensionType();
+    static int                     getCurrentDimensionType();
     static void                    runOnMainThread(std::function<void()> task);
 
     struct Stats {
@@ -176,11 +183,13 @@ private:
     void processAllMainThreadTasks();
     void serialFallbackTick(std::vector<Dimension*>& dimensions);
     void handleTickException(int dimId);
+    bool shouldRecoverFromFallback(); // 检查是否应该恢复
 
     std::unordered_map<int, std::unique_ptr<DimensionWorkerContext>> mContexts;
     LevelTickSnapshot                               mSnapshot;
     std::atomic<bool>                               mFallbackToSerial{false};
     std::atomic<int64_t>                            mLastFallbackGameTime{0};
+    std::atomic<int64_t>                            mLastSuccessfulParallelTick{0}; // 最后一次成功并行tick的时间
     static constexpr int64_t                        RECOVERY_DELAY = 200;
     bool                                            mInitialized = false;
     Stats                                           mStats;
