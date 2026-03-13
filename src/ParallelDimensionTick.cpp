@@ -15,7 +15,7 @@
 
 #include <chrono>
 #include <filesystem>
-#include <thread>
+#include <algorithm>
 
 namespace dim_parallel {
 
@@ -28,15 +28,12 @@ static bool                            hookInstalled = false;
 static thread_local DimensionWorkerContext* tl_currentContext   = nullptr;
 static thread_local bool                   tl_isWorkerThread   = false;
 static thread_local int                    tl_currentDimTypeId = -1;
+static thread_local const char*            tl_currentPhase     = "idle";
 
-// Hook 协调标志
 static std::atomic<bool>       g_inParallelPhase{false};
 static std::atomic<bool>       g_suppressDimensionTick{false};
 static std::vector<Dimension*> g_collectedDimensions;
 static std::mutex              g_collectMutex;
-
-// 诊断：记录崩溃发生在哪个子阶段
-static thread_local const char* tl_currentPhase = "unknown";
 
 // ==================== 配置与日志 ====================
 
@@ -82,6 +79,86 @@ size_t MainThreadTaskQueue::size() const {
     return mTasks.size();
 }
 
+// ==================== WorkerPool ====================
+
+void WorkerPool::start(int numWorkers) {
+    std::lock_guard lock(mMutex);
+    if (!mWorkers.empty()) return;
+    mShutdown = false;
+    for (int i = 0; i < numWorkers; i++) {
+        mWorkers.emplace_back([this]() { workerLoop(); });
+    }
+}
+
+void WorkerPool::stop() {
+    {
+        std::lock_guard lock(mMutex);
+        mShutdown = true;
+    }
+    mWorkerCV.notify_all();
+    for (auto& w : mWorkers) {
+        if (w.joinable()) w.join();
+    }
+    mWorkers.clear();
+}
+
+void WorkerPool::submitAndWait(std::vector<std::function<void()>>& tasks) {
+    if (tasks.empty()) return;
+
+    {
+        std::lock_guard lock(mMutex);
+        mCurrentTasks   = &tasks;
+        mTaskIndex      = 0;
+        mTasksRemaining = static_cast<int>(tasks.size());
+    }
+
+    mWorkerCV.notify_all();
+
+    // 主线程也参与抢任务
+    while (true) {
+        int idx = mTaskIndex.fetch_add(1, std::memory_order_relaxed);
+        if (idx >= static_cast<int>(tasks.size())) break;
+        tasks[idx]();
+        if (mTasksRemaining.fetch_sub(1, std::memory_order_release) == 1) {
+            mDoneCV.notify_one();
+        }
+    }
+
+    // 等待剩余任务完成
+    if (mTasksRemaining.load(std::memory_order_acquire) > 0) {
+        std::unique_lock lock(mMutex);
+        mDoneCV.wait(lock, [this]() {
+            return mTasksRemaining.load(std::memory_order_acquire) <= 0;
+        });
+    }
+
+    {
+        std::lock_guard lock(mMutex);
+        mCurrentTasks = nullptr;
+    }
+}
+
+void WorkerPool::workerLoop() {
+    while (true) {
+        {
+            std::unique_lock lock(mMutex);
+            mWorkerCV.wait(lock, [this]() {
+                return mShutdown || mCurrentTasks != nullptr;
+            });
+            if (mShutdown) return;
+        }
+
+        while (mCurrentTasks) {
+            int idx = mTaskIndex.fetch_add(1, std::memory_order_relaxed);
+            if (idx >= static_cast<int>(mCurrentTasks->size())) break;
+            (*mCurrentTasks)[idx]();
+            if (mTasksRemaining.fetch_sub(1, std::memory_order_release) == 1) {
+                mDoneCV.notify_one();
+            }
+        }
+    }
+}
+
 // ==================== ParallelDimensionTickManager ====================
 
 ParallelDimensionTickManager& ParallelDimensionTickManager::getInstance() {
@@ -91,15 +168,24 @@ ParallelDimensionTickManager& ParallelDimensionTickManager::getInstance() {
 
 void ParallelDimensionTickManager::initialize() {
     if (mInitialized) return;
-    mFallbackToSerial  = false;
-    mShutdownRequested = false;
-    mInitialized       = true;
-    logger().info("ParallelDimensionTickManager initialized");
+    mFallbackToSerial = false;
+
+    // cpu_count - 1 个工作线程，最少 1 个，主线程也参与执行
+    int hwThreads  = static_cast<int>(std::thread::hardware_concurrency());
+    int numWorkers = std::max(1, hwThreads - 1);
+
+    mPool.start(numWorkers);
+    mInitialized = true;
+
+    logger().info(
+        "ParallelDimensionTickManager initialized: {} hw threads, {} workers (main thread also participates)",
+        hwThreads, numWorkers
+    );
 }
 
 void ParallelDimensionTickManager::shutdown() {
     if (!mInitialized) return;
-    mShutdownRequested = true;
+    mPool.stop();
     mContexts.clear();
     mInitialized = false;
     logger().info("ParallelDimensionTickManager shutdown");
@@ -132,7 +218,6 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
         return;
     }
 
-    // 快照
     mSnapshot.time      = level->getTime();
     mSnapshot.simPaused = level->getSimPaused();
 
@@ -142,6 +227,7 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
 
     if (dimensions.empty()) return;
 
+    // 单维度不并行
     if (dimensions.size() == 1) {
         dimensions[0]->tick();
         return;
@@ -149,25 +235,24 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
 
     // 准备上下文
     for (auto* dim : dimensions) {
-        int   dimId = dim->getDimensionId();
-        auto& ctx   = mContexts[dimId];
-        ctx.dimension = dim;
+        int   dimId    = dim->getDimensionId();
+        auto& ctx      = mContexts[dimId];
+        ctx.dimension  = dim;
     }
 
-    // 并行 tick
-    std::latch completionLatch(static_cast<ptrdiff_t>(dimensions.size()));
-
+    // 构建任务列表
+    std::vector<std::function<void()>> tasks;
+    tasks.reserve(dimensions.size());
     for (auto* dim : dimensions) {
-        int   dimId = dim->getDimensionId();
-        auto& ctx   = mContexts[dimId];
-
-        std::thread([this, &ctx, &completionLatch]() {
+        int dimId = dim->getDimensionId();
+        auto& ctx = mContexts[dimId];
+        tasks.emplace_back([this, &ctx]() {
             tickDimensionOnWorker(ctx);
-            completionLatch.count_down();
-        }).detach();
+        });
     }
 
-    completionLatch.wait();
+    // 提交并等待（主线程也参与执行）
+    mPool.submitAndWait(tasks);
 
     // 同步阶段
     processAllMainThreadTasks();
@@ -176,11 +261,12 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
 
     if (config.debug && (mStats.totalParallelTicks % 200 == 0)) {
         logger().info(
-            "Parallel tick #{}: dims={}  mainTasks={}  fallbacks={}",
+            "Parallel tick #{}: dims={}  mainTasks={}  fallbacks={}  workers={}",
             mStats.totalParallelTicks.load(),
             dimensions.size(),
             mStats.totalMainThreadTasks.load(),
-            mStats.totalFallbackTicks.load()
+            mStats.totalFallbackTicks.load(),
+            mPool.workerCount()
         );
         for (auto& [id, ctx] : mContexts) {
             logger().info("  dim[{}]: {}us", id, ctx.lastTickTimeUs);
@@ -248,8 +334,6 @@ void ParallelDimensionTickManager::serialFallbackTick(std::vector<Dimension*>& d
 // ==================== Hooks ====================
 
 using namespace dim_parallel;
-
-// Hook Dimension 内部的子调用，用于诊断崩溃位置
 
 LL_TYPE_INSTANCE_HOOK(
     DimensionTickRedstoneHook,
@@ -350,8 +434,6 @@ LL_TYPE_INSTANCE_HOOK(
         throw;
     }
 }
-
-// 主要 Hook
 
 LL_TYPE_INSTANCE_HOOK(
     DimensionTickHook,
