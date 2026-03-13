@@ -30,40 +30,6 @@ bool saveConfig();
 ll::io::Logger& logger();
 
 //=============================================================================
-// TLS 复制工具
-//=============================================================================
-
-class TlsCloner {
-public:
-    // 在主线程调用，快照当前 TLS
-    bool captureMainThread();
-    // 在工作线程调用，将主线程 TLS 复制到当前线程
-    bool applyToCurrentThread();
-    // 在工作线程 tick 完成后，恢复原始 TLS
-    void restoreCurrentThread();
-
-private:
-    // TEB 中 TLS 相关偏移 (x64)
-    // TEB+0x58 = ThreadLocalStoragePointer
-    // TEB+0x1480 = TlsSlots[64]
-    // TEB+0x1780 = TlsExpansionSlots
-    static constexpr size_t TEB_TLS_POINTER_OFFSET = 0x58;
-    static constexpr size_t TEB_TLS_SLOTS_OFFSET = 0x1480;
-    static constexpr size_t TEB_TLS_SLOTS_COUNT = 64;
-    static constexpr size_t TEB_TLS_EXPANSION_OFFSET = 0x1780;
-
-    void* mMainTlsPointer = nullptr;
-    void* mMainTlsSlots[TEB_TLS_SLOTS_COUNT] = {};
-    void* mMainTlsExpansion = nullptr;
-
-    // 工作线程原始值（用于恢复）
-    void* mSavedTlsPointer = nullptr;
-    void* mSavedTlsSlots[TEB_TLS_SLOTS_COUNT] = {};
-    void* mSavedTlsExpansion = nullptr;
-    bool mCaptured = false;
-};
-
-//=============================================================================
 // 主线程任务队列
 //=============================================================================
 
@@ -108,26 +74,30 @@ private:
 };
 
 //=============================================================================
-// 维度工作线程上下文
+// 维度 Fiber 上下文
 //=============================================================================
 
-struct DimensionWorkerContext {
+struct DimensionFiberContext {
     Dimension* dimensionPtr = nullptr;
+    void* dimFiber = nullptr;          // 维度 tick fiber
     uint64_t lastTickTimeUs = 0;
+    bool tickDone = false;
+    bool faulted = false;
+    DWORD exceptionCode = 0;
+    int dimId = -1;
     MainThreadTaskQueue mainThreadTasks;
-    HANDLE threadHandle = nullptr;
+
+    // 工作线程相关
+    HANDLE workerThread = nullptr;
     std::mutex wakeMutex;
     std::condition_variable wakeCV;
     std::atomic<bool> shouldWork{false};
     std::atomic<bool> shutdown{false};
     std::atomic<bool> tickCompleted{false};
     std::atomic<bool> isProcessing{false};
-    std::atomic<bool> tickFaulted{false};
     std::atomic<uint64_t> tickNumber{0};
     std::atomic<uint64_t> skippedTicks{0};
     std::atomic<uint64_t> totalSkippedTicks{0};
-    TlsCloner tlsCloner;
-    int dimId = -1;
 };
 
 //=============================================================================
@@ -140,8 +110,9 @@ public:
     void initialize();
     void shutdown();
     void dispatchAndSync(class Level* level);
+
     static bool isWorkerThread();
-    static DimensionWorkerContext* getCurrentContext();
+    static DimensionFiberContext* getCurrentContext();
     static void runOnMainThread(std::function<void()> task);
 
     static void markFunctionDangerous(const std::string& funcName);
@@ -151,35 +122,32 @@ public:
         std::atomic<uint64_t> totalParallelTicks{0};
         std::atomic<uint64_t> totalFallbackTicks{0};
         std::atomic<uint64_t> totalMainThreadTasks{0};
-        std::atomic<uint64_t> maxDimTickTimeUs{0};
-        std::atomic<uint64_t> totalRecoveryAttempts{0};
-        std::atomic<uint64_t> totalDangerousFunctions{0};
-        std::atomic<uint64_t> totalSkippedDimensions{0};
-        std::atomic<uint64_t> cycleMainThreadTasks{0};
-        std::atomic<uint64_t> totalTicksSkippedDueToBacklog{0};
         std::atomic<uint64_t> totalSEHCaught{0};
+        std::atomic<uint64_t> totalSkippedDimensions{0};
+        std::atomic<uint64_t> totalRecoveryAttempts{0};
+        std::atomic<uint64_t> totalTicksSkippedDueToBacklog{0};
+        std::atomic<uint64_t> cycleMainThreadTasks{0};
+        std::atomic<uint64_t> totalDangerousFunctions{0};
     };
     Stats& getStats() { return mStats; }
 
 private:
     ParallelDimensionTickManager() = default;
-    void tickDimensionOnWorker(DimensionWorkerContext& ctx);
     void serialFallbackTick(const std::vector<Dimension*>& dimensions);
+    static void CALLBACK dimFiberProc(LPVOID param);
     static DWORD WINAPI workerThreadProc(LPVOID param);
 
-    std::unordered_map<int, std::unique_ptr<DimensionWorkerContext>> mContexts;
+    std::unordered_map<int, std::unique_ptr<DimensionFiberContext>> mContexts;
     std::atomic<bool> mFallbackToSerial{false};
     bool mInitialized = false;
     Stats mStats;
-    TlsCloner mMainTlsSnapshot; // 主线程 TLS 快照
+    int mWorkerCount = 0;
 
     static constexpr uint64_t RECOVERY_INTERVAL_TICKS = 40;
     uint64_t mFallbackStartTick = 0;
 
     static std::unordered_set<std::string> m_dangerousFunctions;
     static std::mutex m_dangerousMutex;
-
-    int mWorkerCount = 0;
 };
 
 class PluginImpl {
