@@ -1,16 +1,21 @@
 #pragma once
+
 #include <ll/api/Config.h>
 #include <ll/api/io/Logger.h>
 #include <ll/api/mod/NativeMod.h>
+
 #include <mc/world/level/BlockPos.h>
 #include <mc/world/level/dimension/Dimension.h>
 #include <mc/network/Packet.h>
-#include <condition_variable>
-#include <mutex>
-#include <vector>
-#include <functional>
-#include <unordered_map>
+
 #include <atomic>
+#include <condition_variable>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <thread>
+#include <unordered_map>
+#include <vector>
 
 namespace dim_parallel {
 
@@ -18,6 +23,7 @@ struct Config {
     int  version = 1;
     bool enabled = true;
     bool debug   = false;
+    // Recovery interval is hardcoded to 1 second (20 ticks), not in config
 };
 
 Config&         getConfig();
@@ -44,8 +50,8 @@ struct LevelTickSnapshot {
 
 struct DimensionWorkerContext {
     Dimension*          dimension = nullptr;
-    MainThreadTaskQueue mainThreadTasks;
     uint64_t            lastTickTimeUs = 0;
+    // Removed per-dimension MainThreadTaskQueue
 };
 
 class WorkerPool {
@@ -77,13 +83,14 @@ private:
 class ParallelDimensionTickManager {
 public:
     static ParallelDimensionTickManager& getInstance();
+
     void initialize();
     void shutdown();
-    void dispatchAndSync(class Level* level, std::vector<Dimension*>& collectedDims);
+    void dispatchAndSync(class Level* level);
 
     static bool                    isWorkerThread();
     static DimensionWorkerContext* getCurrentContext();
-    static int                     getCurrentDimensionId();
+    static DimensionType           getCurrentDimensionType();
     static void                    runOnMainThread(std::function<void()> task);
 
     WorkerPool& getWorkerPool() { return mPool; }
@@ -93,27 +100,30 @@ public:
         std::atomic<uint64_t> totalFallbackTicks{0};
         std::atomic<uint64_t> totalMainThreadTasks{0};
         std::atomic<uint64_t> maxDimTickTimeUs{0};
-        std::atomic<int>      consecutiveFailures{0};
-        std::atomic<int64_t>  lastFailureTimeMs{0};
+        std::atomic<uint64_t> totalRecoveryAttempts{0};  // New statistic
     };
     Stats& getStats() { return mStats; }
 
 private:
     ParallelDimensionTickManager() = default;
+
     void tickDimensionOnWorker(DimensionWorkerContext& ctx);
     void processAllMainThreadTasks();
     void serialFallbackTick(std::vector<Dimension*>& dimensions);
-    bool shouldUseFallback();
-    void recordFailure();
-    void tryRecoverFromFallback();
 
-    std::vector<DimensionWorkerContext*> mContextSnapshot;
     std::unordered_map<int, DimensionWorkerContext> mContexts;
     LevelTickSnapshot                               mSnapshot;
     WorkerPool                                      mPool;
     std::atomic<bool>                               mFallbackToSerial{false};
     bool                                            mInitialized = false;
     Stats                                           mStats;
+
+    // Global main thread task queue (merged)
+    MainThreadTaskQueue                             mMainThreadTasks;
+
+    // Recovery mechanism
+    static constexpr uint64_t                       RECOVERY_INTERVAL_TICKS = 20; // 1 second at 20 tps
+    uint64_t                                         mFallbackStartTick = 0;
 };
 
 class PluginImpl {
