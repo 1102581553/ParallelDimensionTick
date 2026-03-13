@@ -192,7 +192,10 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
         if (dim) {
             validDims.push_back(dim);
         } else {
-            logger().debug("Skipping null dimension pointer during parallel tick");
+            // 修改点：将 logger().debug 改为条件判断 + info
+            if (config.debug) {
+                logger().info("Skipping null dimension pointer during parallel tick");
+            }
             mStats.totalSkippedDimensions++;
         }
     }
@@ -208,7 +211,10 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
         uint64_t currentTick = level->getTime();
         if (currentTick - mFallbackStartTick >= RECOVERY_INTERVAL_TICKS) {
             mStats.totalRecoveryAttempts++;
-            logger().debug("Attempting recovery from fallback mode at tick {}", currentTick);
+            // 修改点：将 logger().debug 改为条件判断 + info
+            if (config.debug) {
+                logger().info("Attempting recovery from fallback mode at tick {}", currentTick);
+            }
             mFallbackToSerial.store(false, std::memory_order_relaxed);
         } else {
             serialFallbackTick(dimRefs);
