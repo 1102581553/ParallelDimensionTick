@@ -6,7 +6,6 @@
 #include <mc/world/level/dimension/Dimension.h>
 #include <mc/network/Packet.h>
 #include <atomic>
-#include <condition_variable>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -22,7 +21,6 @@ struct Config {
     int version = 1;
     bool enabled = true;
     bool debug = false;
-    int workerStackSizeMB = 256; // 工作线程栈大小（MB）
 };
 
 Config& getConfig();
@@ -30,74 +28,21 @@ bool loadConfig();
 bool saveConfig();
 ll::io::Logger& logger();
 
-class MainThreadTaskQueue {
-public:
-    MainThreadTaskQueue() : mWriteBuffer(0) {}
-
-    void enqueue(std::function<void()> task) {
-        int writeIdx = mWriteBuffer.load(std::memory_order_relaxed);
-        std::lock_guard lock(mBufferMutex[writeIdx]);
-        mBuffers[writeIdx].push_back(std::move(task));
-    }
-
-    void processAll() {
-        int readIdx = mWriteBuffer.load(std::memory_order_relaxed);
-        int newWrite = 1 - readIdx;
-        mWriteBuffer.store(newWrite, std::memory_order_release);
-
-        std::vector<std::function<void()>> tasks;
-        {
-            std::lock_guard lock(mBufferMutex[readIdx]);
-            tasks.swap(mBuffers[readIdx]);
-        }
-        for (auto& task : tasks) {
-            try {
-                task();
-            } catch (...) {}
-        }
-    }
-
-    size_t size() const {
-        size_t total = 0;
-        for (int i = 0; i < 2; ++i) {
-            std::lock_guard lock(mBufferMutex[i]);
-            total += mBuffers[i].size();
-        }
-        return total;
-    }
-
-private:
-    std::atomic<int> mWriteBuffer;
-    mutable std::mutex mBufferMutex[2];
-    std::vector<std::function<void()>> mBuffers[2];
-};
-
 struct LevelTickSnapshot {
     int time = 0;
     bool simPaused = false;
 };
 
-struct DimensionWorkerContext {
+// Fiber 上下文：每个维度一个 fiber
+struct DimensionFiberContext {
     Dimension* dimensionPtr = nullptr;
+    void* fiber = nullptr;           // 维度 fiber
+    void* callerFiber = nullptr;     // 调度 fiber（主线程）
     uint64_t lastTickTimeUs = 0;
-    MainThreadTaskQueue mainThreadTasks;
-    HANDLE threadHandle = nullptr;
-    std::mutex wakeMutex;
-    std::condition_variable wakeCV;
-    std::atomic<bool> shouldWork{false};
-    std::atomic<bool> shutdown{false};
-    std::atomic<bool> tickCompleted{false};
-    std::atomic<bool> isProcessing{false};
-    std::atomic<bool> tickFaulted{false};
-    std::atomic<uint64_t> tickNumber{0};
-    std::atomic<uint64_t> skippedTicks{0};
-    std::atomic<uint64_t> totalSkippedTicks{0};
-};
-
-struct TickResult {
-    DWORD exceptionCode;
-    bool success;
-    char phase[64];
+    bool tickDone = false;
+    bool faulted = false;
+    DWORD exceptionCode = 0;
+    int dimId = -1;
 };
 
 class ParallelDimensionTickManager {
@@ -106,45 +51,29 @@ public:
     void initialize();
     void shutdown();
     void dispatchAndSync(class Level* level);
-    static bool isWorkerThread();
-    static DimensionWorkerContext* getCurrentContext();
-    static DimensionType getCurrentDimensionType();
-    static void runOnMainThread(std::function<void()> task);
-
-    static void markFunctionDangerous(const std::string& funcName);
-    static bool isFunctionDangerous(const std::string& funcName);
 
     struct Stats {
-        std::atomic<uint64_t> totalParallelTicks{0};
+        std::atomic<uint64_t> totalTicks{0};
         std::atomic<uint64_t> totalFallbackTicks{0};
-        std::atomic<uint64_t> totalMainThreadTasks{0};
-        std::atomic<uint64_t> maxDimTickTimeUs{0};
-        std::atomic<uint64_t> totalRecoveryAttempts{0};
-        std::atomic<uint64_t> totalDangerousFunctions{0};
-        std::atomic<uint64_t> totalSkippedDimensions{0};
-        std::atomic<uint64_t> cycleMainThreadTasks{0};
-        std::atomic<uint64_t> totalTicksSkippedDueToBacklog{0};
         std::atomic<uint64_t> totalSEHCaught{0};
+        std::atomic<uint64_t> totalSkippedDimensions{0};
+        std::atomic<uint64_t> totalRecoveryAttempts{0};
     };
     Stats& getStats() { return mStats; }
 
 private:
     ParallelDimensionTickManager() = default;
-    void tickDimensionOnWorker(DimensionWorkerContext& ctx);
     void serialFallbackTick(const std::vector<Dimension*>& dimensions);
-    static DWORD WINAPI workerThreadProc(LPVOID param);
+    static void CALLBACK fiberProc(LPVOID param);
 
-    std::unordered_map<int, std::unique_ptr<DimensionWorkerContext>> mContexts;
+    std::unordered_map<int, std::unique_ptr<DimensionFiberContext>> mContexts;
     LevelTickSnapshot mSnapshot;
     std::atomic<bool> mFallbackToSerial{false};
     bool mInitialized = false;
     Stats mStats;
 
-    static constexpr uint64_t RECOVERY_INTERVAL_TICKS = 20;
+    static constexpr uint64_t RECOVERY_INTERVAL_TICKS = 40;
     uint64_t mFallbackStartTick = 0;
-
-    static std::unordered_set<std::string> m_dangerousFunctions;
-    static std::mutex m_dangerousMutex;
 };
 
 class PluginImpl {
