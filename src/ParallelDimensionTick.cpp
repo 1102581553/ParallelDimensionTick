@@ -141,7 +141,10 @@ bool ParallelDimensionTickManager::shouldRecoverFromFallback() {
 void ParallelDimensionTickManager::dispatchAndSync(Level* level, std::vector<Dimension*>& dimensions) {
     if (!level || !mInitialized) {
         serialFallbackTick(dimensions);
-        return mSnapshot.time      = level->getTime();
+        return;
+    }
+
+    mSnapshot.time      = level->getTime();
     mSnapshot.simPaused = level->getSimPaused();
     
     if (config.debug) {
@@ -180,13 +183,18 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level, std::vector<Dim
     }
 
     // 添加tick任务到各维度的专属线程
+    std::atomic<int> pendingDimensions{0};
+    pendingDimensions.store(static_cast<int>(dimensions.size()), std::memory_order_release);
+
     for (auto* dim : dimensions) {
         int dimId = dim->getDimensionId();
         auto& ctx = mContexts[dimId];
         
         // 添加tick任务到该维度的专属线程
-        ctx->addTickTask([this, &ctx]() {
+        ctx->addTickTask([&pendingDimensions, this, &ctx]() {
             tickDimensionAsync(ctx);
+            // 任务完成后减少计数
+            pendingDimensions.fetch_sub(1, std::memory_order_release);
         });
     }
 
@@ -194,32 +202,10 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level, std::vector<Dim
         logger().info("Added tick tasks to {} dimension threads", dimensions.size());
     }
 
-    // 在等待维度线程完成的过程中，同时处理主线程任务
-    // 这样可以避免死锁：主线程在等待时也能处理来自工作线程的主线程任务
-    bool allCompleted = false;
-    while (!allCompleted) {
-        allCompleted = true;
-        
-        // 检查每个维度的完成状态
-        for (auto* dim : dimensions) {
-            int dimId = dim->getDimensionId();
-            auto& ctx = mContexts[dimId];
-            
-            // 尝试处理主线程任务（非阻塞）
-            {
-                std::lock_guard lock(ctx.queueMutex);
-                if (ctx.hasPendingWork.load(std::memory_order_acquire) || 
-                    ctx.isWorking.load(std::memory_order_acquire)) {
-                    allCompleted = false;
-                }
-            }
-        }
-        
-        // 处理主线程任务（如果有）
-        if (!allCompleted) {
-            processAllMainThreadTasks();
-            std::this_thread::sleep_for(std::chrono::microseconds(10)); // 避免CPU空转
-        }
+    // 等待所有维度线程完成任务，同时处理主线程任务以避免死锁
+    while (pendingDimensions.load(std::memory_order_acquire) > 0) {
+        processAllMainThreadTasks();
+        std::this_thread::sleep_for(std::chrono::microseconds(10)); // 避免CPU空转
     }
     
     if (config.debug) {
