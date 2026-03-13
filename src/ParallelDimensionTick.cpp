@@ -84,7 +84,9 @@ size_t MainThreadTaskQueue::size() const {
 void WorkerPool::start(int numWorkers) {
     std::lock_guard lock(mMutex);
     if (!mWorkers.empty()) return;
-    mShutdown = false;
+    mShutdown   = false;
+    mGeneration = 0;
+    mWorkerGen  = 0;
     for (int i = 0; i < numWorkers; i++) {
         mWorkers.emplace_back([this]() { workerLoop(); });
     }
@@ -94,8 +96,9 @@ void WorkerPool::stop() {
     {
         std::lock_guard lock(mMutex);
         mShutdown = true;
+        mGeneration++;
     }
-    mWorkerCV.notify_all();
+    mStartCV.notify_all();
     for (auto& w : mWorkers) {
         if (w.joinable()) w.join();
     }
@@ -105,54 +108,58 @@ void WorkerPool::stop() {
 void WorkerPool::submitAndWait(std::vector<std::function<void()>>& tasks) {
     if (tasks.empty()) return;
 
+    int taskCount = static_cast<int>(tasks.size());
+
+    // 设置任务
     {
         std::lock_guard lock(mMutex);
-        mCurrentTasks   = &tasks;
+        mTasks          = tasks; // 拷贝任务列表
         mTaskIndex      = 0;
-        mTasksRemaining = static_cast<int>(tasks.size());
+        mTasksRemaining = taskCount;
+        mGeneration++;  // 递增代数，唤醒工作线程
     }
-
-    mWorkerCV.notify_all();
+    mStartCV.notify_all();
 
     // 主线程也参与抢任务
     while (true) {
         int idx = mTaskIndex.fetch_add(1, std::memory_order_relaxed);
-        if (idx >= static_cast<int>(tasks.size())) break;
-        tasks[idx]();
-        if (mTasksRemaining.fetch_sub(1, std::memory_order_release) == 1) {
+        if (idx >= taskCount) break;
+        mTasks[idx]();
+        if (mTasksRemaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
             mDoneCV.notify_one();
         }
     }
 
-    // 等待剩余任务完成
-    if (mTasksRemaining.load(std::memory_order_acquire) > 0) {
+    // 等待所有任务完成
+    {
         std::unique_lock lock(mMutex);
         mDoneCV.wait(lock, [this]() {
             return mTasksRemaining.load(std::memory_order_acquire) <= 0;
         });
     }
-
-    {
-        std::lock_guard lock(mMutex);
-        mCurrentTasks = nullptr;
-    }
 }
 
 void WorkerPool::workerLoop() {
+    uint64_t localGen = 0;
+
     while (true) {
+        // 等待新一批任务或关闭信号
         {
             std::unique_lock lock(mMutex);
-            mWorkerCV.wait(lock, [this]() {
-                return mShutdown || mCurrentTasks != nullptr;
+            mStartCV.wait(lock, [this, &localGen]() {
+                return mShutdown || mGeneration > localGen;
             });
             if (mShutdown) return;
+            localGen = mGeneration;
         }
 
-        while (mCurrentTasks) {
+        // 抢任务执行
+        int taskCount = static_cast<int>(mTasks.size());
+        while (true) {
             int idx = mTaskIndex.fetch_add(1, std::memory_order_relaxed);
-            if (idx >= static_cast<int>(mCurrentTasks->size())) break;
-            (*mCurrentTasks)[idx]();
-            if (mTasksRemaining.fetch_sub(1, std::memory_order_release) == 1) {
+            if (idx >= taskCount) break;
+            mTasks[idx]();
+            if (mTasksRemaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
                 mDoneCV.notify_one();
             }
         }
@@ -170,7 +177,6 @@ void ParallelDimensionTickManager::initialize() {
     if (mInitialized) return;
     mFallbackToSerial = false;
 
-    // cpu_count - 1 个工作线程，最少 1 个，主线程也参与执行
     int hwThreads  = static_cast<int>(std::thread::hardware_concurrency());
     int numWorkers = std::max(1, hwThreads - 1);
 
@@ -178,7 +184,7 @@ void ParallelDimensionTickManager::initialize() {
     mInitialized = true;
 
     logger().info(
-        "ParallelDimensionTickManager initialized: {} hw threads, {} workers (main thread also participates)",
+        "ParallelDimensionTickManager initialized: {} hw threads, {} workers + main thread",
         hwThreads, numWorkers
     );
 }
@@ -227,7 +233,6 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
 
     if (dimensions.empty()) return;
 
-    // 单维度不并行
     if (dimensions.size() == 1) {
         dimensions[0]->tick();
         return;
@@ -235,23 +240,23 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
 
     // 准备上下文
     for (auto* dim : dimensions) {
-        int   dimId    = dim->getDimensionId();
-        auto& ctx      = mContexts[dimId];
-        ctx.dimension  = dim;
+        int   dimId   = dim->getDimensionId();
+        auto& ctx     = mContexts[dimId];
+        ctx.dimension = dim;
     }
 
-    // 构建任务列表
+    // 构建任务
     std::vector<std::function<void()>> tasks;
     tasks.reserve(dimensions.size());
     for (auto* dim : dimensions) {
-        int dimId = dim->getDimensionId();
-        auto& ctx = mContexts[dimId];
+        int   dimId = dim->getDimensionId();
+        auto& ctx   = mContexts[dimId];
         tasks.emplace_back([this, &ctx]() {
             tickDimensionOnWorker(ctx);
         });
     }
 
-    // 提交并等待（主线程也参与执行）
+    // 并行执行
     mPool.submitAndWait(tasks);
 
     // 同步阶段
@@ -426,13 +431,12 @@ LL_TYPE_INSTANCE_HOOK(
         origin();
         return;
     }
-    // 延迟到主线程执行，避免并发访问 ChunkGenerationManager
+    // 延迟到主线程
     Dimension* self = this;
     ParallelDimensionTickManager::runOnMainThread([self]() {
         self->_runChunkGenerationWatchdog();
     });
 }
-
 
 LL_TYPE_INSTANCE_HOOK(
     DimensionTickHook,
