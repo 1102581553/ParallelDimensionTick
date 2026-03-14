@@ -13,9 +13,7 @@
 #include <chrono>
 #include <filesystem>
 #include <string>
-#include <unordered_map>
 #include <utility>
-#include <vector>
 
 namespace dim_parallel {
 
@@ -23,17 +21,17 @@ static Config                           config;
 static std::shared_ptr<ll::io::Logger> log;
 static bool                             hookInstalled = false;
 
-static thread_local DimensionWorkerContext* tl_currentContext      = nullptr;
-static thread_local bool                    tl_isWorkerThread      = false;
-static thread_local bool                    tl_replayingActorPhase = false;
-static thread_local int                     tl_currentDimTypeId    = -1;
-static thread_local const char*             tl_currentPhase        = "idle";
+static thread_local DimensionWorkerContext* tl_currentContext            = nullptr;
+static thread_local bool                    tl_isWorkerThread            = false;
+static thread_local bool                    tl_insideNormalTickChain     = false;
+static thread_local int                     tl_currentDimTypeId          = -1;
+static thread_local const char*             tl_currentPhase              = "idle";
 
 // 危险函数恢复：funcName -> recoverAtTick
 static std::unordered_map<std::string, uint64_t> g_dangerousFunctions;
 static std::mutex                                g_dangerousMutex;
 
-MainThreadTaskQueue ParallelActorTickManager::mMainThreadTasks;
+MainThreadTaskQueue ParallelNormalTickManager::mMainThreadTasks;
 
 namespace {
 
@@ -63,10 +61,10 @@ private:
     const char* mPrev;
 };
 
-class ScopedReplayActorPhase {
+class ScopedNormalTickChain {
 public:
-    ScopedReplayActorPhase() noexcept : mPrev(tl_replayingActorPhase) { tl_replayingActorPhase = true; }
-    ~ScopedReplayActorPhase() noexcept { tl_replayingActorPhase = mPrev; }
+    ScopedNormalTickChain() noexcept : mPrev(tl_insideNormalTickChain) { tl_insideNormalTickChain = true; }
+    ~ScopedNormalTickChain() noexcept { tl_insideNormalTickChain = mPrev; }
 
 private:
     bool mPrev;
@@ -74,13 +72,13 @@ private:
 
 template <typename Func>
 inline void forwardToMainThread(Func&& func) {
-    ParallelActorTickManager::runOnMainThread(
+    ParallelNormalTickManager::runOnMainThread(
         [forwarded = std::forward<Func>(func)]() mutable { forwarded(); }
     );
 }
 
 inline bool shouldActorRunOnMainThread(Actor& actor) {
-    if (!ParallelActorTickManager::isWorkerThread()) {
+    if (!ParallelNormalTickManager::isWorkerThread()) {
         return false;
     }
 
@@ -88,7 +86,7 @@ inline bool shouldActorRunOnMainThread(Actor& actor) {
         return true;
     }
 
-    auto* ctx = ParallelActorTickManager::getCurrentContext();
+    auto* ctx = ParallelNormalTickManager::getCurrentContext();
     if (ctx == nullptr) {
         return false;
     }
@@ -98,7 +96,7 @@ inline bool shouldActorRunOnMainThread(Actor& actor) {
 }
 
 inline bool shouldPushRunOnMainThread(Actor& self, Actor& other) {
-    if (!ParallelActorTickManager::isWorkerThread()) {
+    if (!ParallelNormalTickManager::isWorkerThread()) {
         return false;
     }
 
@@ -106,7 +104,7 @@ inline bool shouldPushRunOnMainThread(Actor& self, Actor& other) {
         return true;
     }
 
-    auto* ctx = ParallelActorTickManager::getCurrentContext();
+    auto* ctx = ParallelNormalTickManager::getCurrentContext();
     if (ctx == nullptr) {
         return false;
     }
@@ -131,8 +129,8 @@ inline void handleSensitiveFunction(const char* funcName, Actor& actor, Func&& f
         return;
     }
 
-    if (ParallelActorTickManager::isWorkerThread() &&
-        ParallelActorTickManager::isFunctionDangerous(funcName)) {
+    if (ParallelNormalTickManager::isWorkerThread() &&
+        ParallelNormalTickManager::isFunctionDangerous(funcName)) {
         forwardToMainThread(std::forward<Func>(func));
         return;
     }
@@ -147,7 +145,7 @@ inline void handlePlayerFunction(const char* funcName, Func&& func) {
         return;
     }
 
-    if (ParallelActorTickManager::isWorkerThread()) {
+    if (ParallelNormalTickManager::isWorkerThread()) {
         forwardToMainThread(std::forward<Func>(func));
         return;
     }
@@ -168,8 +166,8 @@ inline void handlePushFunction(const char* funcName, Actor& self, Actor& other, 
         return;
     }
 
-    if (ParallelActorTickManager::isWorkerThread() &&
-        ParallelActorTickManager::isFunctionDangerous(funcName)) {
+    if (ParallelNormalTickManager::isWorkerThread() &&
+        ParallelNormalTickManager::isFunctionDangerous(funcName)) {
         forwardToMainThread(std::forward<Func>(func));
         return;
     }
@@ -271,80 +269,43 @@ size_t MainThreadTaskQueue::size() const {
 }
 
 //=============================================================================
-// ParallelActorTickManager
+// ParallelNormalTickManager
 //=============================================================================
 
-ParallelActorTickManager& ParallelActorTickManager::getInstance() {
-    static ParallelActorTickManager instance;
+ParallelNormalTickManager& ParallelNormalTickManager::getInstance() {
+    static ParallelNormalTickManager instance;
     return instance;
 }
 
-int ParallelActorTickManager::phaseOrder(ActorTickPhase phase) {
-    switch (phase) {
-    case ActorTickPhase::BaseTick: return 1;
-    case ActorTickPhase::NormalTick: return 2;
-    case ActorTickPhase::AiStep: return 3;
-    case ActorTickPhase::PassengerTick: return 4;
-    default: return 0;
-    }
-}
-
-const char* ParallelActorTickManager::phaseName(ActorTickPhase phase) {
-    switch (phase) {
-    case ActorTickPhase::BaseTick: return "ActorPhase::BaseTick";
-    case ActorTickPhase::NormalTick: return "ActorPhase::NormalTick";
-    case ActorTickPhase::AiStep: return "ActorPhase::AiStep";
-    case ActorTickPhase::PassengerTick: return "ActorPhase::PassengerTick";
-    default: return "ActorPhase::None";
-    }
-}
-
-uint64_t ParallelActorTickManager::getCurrentTick() const {
-    return mCurrentTick.load(std::memory_order_acquire);
-}
-
-bool ParallelActorTickManager::isStopping() const {
+bool ParallelNormalTickManager::isStopping() const {
     return mStopping.load(std::memory_order_acquire);
 }
 
-void ParallelActorTickManager::initialize() {
+void ParallelNormalTickManager::initialize() {
     if (mInitialized) {
         return;
     }
 
     mStopping.store(false, std::memory_order_release);
-    mActiveDispatches.store(0, std::memory_order_release);
     mCurrentTick.store(0, std::memory_order_release);
-
     mStats.reset();
-    mWindowStats    = WindowStats{};
-    mCurrentPhase   = ActorTickPhase::None;
-    mInLevelTick    = false;
-    mBypassCurrentTick = false;
-    clearCurrentPhaseBuckets();
-
+    mWindowStats = WindowStats{};
+    mInLevelTick = false;
     mInitialized = true;
 
     logger().info(
-        "Initialized actor parallel model. actorPhase={} recovery={} debugWindow={}",
-        config.parallelActorPhase,
-        RECOVERY_INTERVAL_TICKS,
+        "Initialized normalTick parallel model. enabled={} debugWindow={}",
+        config.parallelNormalTick,
         DEBUG_WINDOW_TICKS
     );
 }
 
-void ParallelActorTickManager::shutdown() {
+void ParallelNormalTickManager::shutdown() {
     if (!mInitialized) {
         return;
     }
 
     mStopping.store(true, std::memory_order_release);
-
-    while (mActiveDispatches.load(std::memory_order_acquire) > 0) {
-        processAllMainThreadTasks();
-        std::unique_lock waitLock(mDispatchMutex);
-        mDispatchCV.wait_for(waitLock, std::chrono::milliseconds(1));
-    }
 
     processAllMainThreadTasks();
 
@@ -353,9 +314,8 @@ void ParallelActorTickManager::shutdown() {
         for (auto& [id, ctx] : mContexts) {
             if (ctx && ctx->workerThread.joinable()) {
                 {
-                    std::lock_guard wakeLock(ctx->wakeMutex);
-                    ctx->shutdown   = true;
-                    ctx->shouldWork = false;
+                    std::lock_guard queueLock(ctx->queueMutex);
+                    ctx->shutdown = true;
                 }
                 ctx->wakeCV.notify_one();
             }
@@ -372,46 +332,44 @@ void ParallelActorTickManager::shutdown() {
         mContexts.clear();
     }
 
-    clearCurrentPhaseBuckets();
     mCurrentTick.store(0, std::memory_order_release);
     mInitialized = false;
     logger().info("Shutdown");
 }
 
-bool ParallelActorTickManager::isWorkerThread() { return tl_isWorkerThread; }
+bool ParallelNormalTickManager::isWorkerThread() { return tl_isWorkerThread; }
 
-DimensionWorkerContext* ParallelActorTickManager::getCurrentContext() { return tl_currentContext; }
+DimensionWorkerContext* ParallelNormalTickManager::getCurrentContext() { return tl_currentContext; }
 
-DimensionType ParallelActorTickManager::getCurrentDimensionType() {
+DimensionType ParallelNormalTickManager::getCurrentDimensionType() {
     return static_cast<DimensionType>(tl_currentDimTypeId);
 }
 
-void ParallelActorTickManager::notifyDispatchProgress() {
-    mDispatchCV.notify_one();
-}
-
-void ParallelActorTickManager::runOnMainThread(std::function<void()> task) {
+void ParallelNormalTickManager::runOnMainThread(std::function<void()> task) {
     if (!tl_isWorkerThread || tl_currentContext == nullptr) {
         task();
         return;
     }
 
-    auto& manager = getInstance();
-    auto  sync    = mMainThreadTasks.enqueueSync(std::move(task));
+    auto sync = mMainThreadTasks.enqueueSync(std::move(task));
 
-    manager.notifyDispatchProgress();
-
-    std::unique_lock lock(sync->mutex);
-    sync->cv.wait(lock, [&sync] { return sync->done; });
+    for (;;) {
+        {
+            std::unique_lock lock(sync->mutex);
+            if (sync->cv.wait_for(lock, std::chrono::milliseconds(1), [&sync] { return sync->done; })) {
+                break;
+            }
+        }
+    }
 
     if (sync->exception) {
         std::rethrow_exception(sync->exception);
     }
 }
 
-void ParallelActorTickManager::markFunctionDangerous(const std::string& funcName) {
+void ParallelNormalTickManager::markFunctionDangerous(const std::string& funcName) {
     auto&    manager   = getInstance();
-    uint64_t nowTick   = manager.getCurrentTick();
+    uint64_t nowTick   = manager.mCurrentTick.load(std::memory_order_acquire);
     uint64_t recoverAt = nowTick + RECOVERY_INTERVAL_TICKS;
 
     std::lock_guard lock(g_dangerousMutex);
@@ -438,9 +396,9 @@ void ParallelActorTickManager::markFunctionDangerous(const std::string& funcName
     manager.mStats.totalDangerousFunctions.fetch_add(1, std::memory_order_relaxed);
 }
 
-bool ParallelActorTickManager::isFunctionDangerous(const std::string& funcName) {
+bool ParallelNormalTickManager::isFunctionDangerous(const std::string& funcName) {
     auto&    manager = getInstance();
-    uint64_t nowTick = manager.getCurrentTick();
+    uint64_t nowTick = manager.mCurrentTick.load(std::memory_order_acquire);
 
     std::lock_guard lock(g_dangerousMutex);
 
@@ -458,8 +416,8 @@ bool ParallelActorTickManager::isFunctionDangerous(const std::string& funcName) 
     return true;
 }
 
-void ParallelActorTickManager::beginLevelTick(Level* level) {
-    if (!mInitialized || !config.parallelActorPhase || !level) {
+void ParallelNormalTickManager::beginLevelTick(Level* level) {
+    if (!mInitialized || !config.parallelNormalTick || !level) {
         mInLevelTick = false;
         return;
     }
@@ -467,103 +425,87 @@ void ParallelActorTickManager::beginLevelTick(Level* level) {
     mSnapshot.time      = level->getTime();
     mSnapshot.simPaused = level->getSimPaused();
     mCurrentTick.store(static_cast<uint64_t>(mSnapshot.time), std::memory_order_release);
-
-    mCurrentPhase      = ActorTickPhase::None;
-    mInLevelTick       = !mSnapshot.simPaused;
-    mBypassCurrentTick = false;
-    clearCurrentPhaseBuckets();
+    mInLevelTick = !mSnapshot.simPaused;
 }
 
-void ParallelActorTickManager::endLevelTick() {
-    if (!mInLevelTick) {
-        return;
-    }
-
-    flushCurrentPhase();
-    mCurrentPhase = ActorTickPhase::None;
-    mInLevelTick  = false;
-    mBypassCurrentTick = false;
-    clearCurrentPhaseBuckets();
+void ParallelNormalTickManager::endLevelTick() {
+    mInLevelTick = false;
+    processAllMainThreadTasks();
 }
 
-void ParallelActorTickManager::clearCurrentPhaseBuckets() {
-    mCurrentPhaseBuckets.clear();
-}
+DimensionWorkerContext* ParallelNormalTickManager::getOrCreateWorker(int dimensionId) {
+    std::lock_guard lock(mContextsMutex);
 
-void ParallelActorTickManager::collectActor(Actor& actor, bool isMob) {
-    const int dimId = static_cast<int>(actor.getDimensionId());
-    auto& bucket = mCurrentPhaseBuckets[dimId];
-
-    auto it = bucket.index.find(&actor);
-    if (it == bucket.index.end()) {
-        const size_t idx = bucket.items.size();
-        bucket.items.push_back(ActorWorkItem{
-            .actor = &actor,
-            .isMob = isMob,
-        });
-        bucket.index.emplace(&actor, idx);
-    } else {
-        bucket.items[it->second].isMob = bucket.items[it->second].isMob || isMob;
-    }
-}
-
-bool ParallelActorTickManager::interceptActorPhase(Actor& actor, ActorTickPhase phase, bool isMob) {
-    if (!mInitialized || !config.parallelActorPhase || !mInLevelTick || mBypassCurrentTick) {
-        return false;
+    auto it = mContexts.find(dimensionId);
+    if (it != mContexts.end() && it->second) {
+        return it->second.get();
     }
 
-    if (actor.isPlayer()) {
-        return false;
-    }
-
-    const char* curPhaseName = phaseName(phase);
-    if (isFunctionDangerous(curPhaseName)) {
-        return false;
-    }
-
-    if (mCurrentPhase == ActorTickPhase::None) {
-        mCurrentPhase = phase;
-    } else if (mCurrentPhase != phase) {
-        if (phaseOrder(phase) < phaseOrder(mCurrentPhase)) {
-            logger().warn(
-                "Unexpected actor phase order: current={} next={}, bypassing actor parallel for this tick",
-                phaseName(mCurrentPhase),
-                phaseName(phase)
-            );
-            flushCurrentPhase();
-            mBypassCurrentTick = true;
-            return false;
+    auto ctx = std::make_unique<DimensionWorkerContext>();
+    auto* raw = ctx.get();
+    raw->dimensionId = dimensionId;
+    raw->workerThread = std::thread(&ParallelNormalTickManager::workerLoop, this, raw);
+    auto [insertIt, inserted] = mContexts.emplace(dimensionId, std::move(ctx));
+    if (!inserted || !insertIt->second) {
+        if (raw->workerThread.joinable()) {
+            {
+                std::lock_guard queueLock(raw->queueMutex);
+                raw->shutdown = true;
+            }
+            raw->wakeCV.notify_one();
+            raw->workerThread.join();
         }
-
-        flushCurrentPhase();
-        mCurrentPhase = phase;
+        return nullptr;
     }
-
-    collectActor(actor, isMob);
-    return true;
+    return insertIt->second.get();
 }
 
-void ParallelActorTickManager::workerLoop(DimensionWorkerContext* ctx) {
+void ParallelNormalTickManager::workerLoop(DimensionWorkerContext* ctx) {
     tl_isWorkerThread   = true;
     tl_currentContext   = ctx;
-    tl_currentDimTypeId = -1;
+    tl_currentDimTypeId = ctx->dimensionId;
     tl_currentPhase     = "idle";
 
-    while (true) {
-        std::unique_lock lock(ctx->wakeMutex);
-        ctx->wakeCV.wait(lock, [ctx] { return ctx->shouldWork || ctx->shutdown; });
+    for (;;) {
+        DimensionWorkerContext::TaskItem task;
 
-        if (ctx->shutdown) {
-            break;
+        {
+            std::unique_lock lock(ctx->queueMutex);
+            ctx->wakeCV.wait(lock, [ctx] { return ctx->shutdown || !ctx->tasks.empty(); });
+
+            if (ctx->shutdown && ctx->tasks.empty()) {
+                break;
+            }
+
+            task = std::move(ctx->tasks.front());
+            ctx->tasks.pop_front();
         }
 
-        ctx->shouldWork = false;
-        lock.unlock();
+        auto start = std::chrono::steady_clock::now();
+        std::exception_ptr taskException;
 
-        processActorPhaseOnWorker(*ctx);
+        try {
+            tl_currentPhase = task.debugName.c_str();
+            task.fn();
+            tl_currentPhase = "idle";
+        } catch (...) {
+            taskException = std::current_exception();
+            tl_currentPhase = "idle";
+        }
 
-        ctx->jobCompleted.store(true, std::memory_order_release);
-        notifyDispatchProgress();
+        auto end = std::chrono::steady_clock::now();
+        ctx->lastTaskTimeUs = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(end - start).count()
+        );
+
+        if (task.sync) {
+            {
+                std::lock_guard syncLock(task.sync->mutex);
+                task.sync->done      = true;
+                task.sync->exception = taskException;
+            }
+            task.sync->cv.notify_one();
+        }
     }
 
     tl_isWorkerThread   = false;
@@ -572,243 +514,78 @@ void ParallelActorTickManager::workerLoop(DimensionWorkerContext* ctx) {
     tl_currentPhase     = "idle";
 }
 
-void ParallelActorTickManager::processActorPhaseOnWorker(DimensionWorkerContext& ctx) {
-    tl_isWorkerThread   = true;
-    tl_currentContext   = &ctx;
-    tl_currentDimTypeId = ctx.dimensionId;
-    tl_currentPhase     = phaseName(ctx.phase);
+void ParallelNormalTickManager::runActorNormalTick(Actor& actor, const char* funcName, std::function<void()> fn) {
+    ScopedNormalTickChain chain;
 
-    auto start = std::chrono::steady_clock::now();
-
-    try {
-        for (auto& item : ctx.actorTasks) {
-            if (item.actor == nullptr) {
-                continue;
-            }
-
-            if (item.actor->isPlayer()) {
-                continue;
-            }
-
-            if (static_cast<int>(item.actor->getDimensionId()) != ctx.dimensionId) {
-                continue;
-            }
-
-            ScopedReplayActorPhase replay;
-
-            switch (ctx.phase) {
-            case ActorTickPhase::BaseTick:
-                if (item.isMob) {
-                    static_cast<Mob*>(item.actor)->baseTick();
-                } else {
-                    item.actor->baseTick();
-                }
-                break;
-            case ActorTickPhase::NormalTick:
-                if (item.isMob) {
-                    static_cast<Mob*>(item.actor)->normalTick();
-                } else {
-                    item.actor->normalTick();
-                }
-                break;
-            case ActorTickPhase::AiStep:
-                if (item.isMob) {
-                    static_cast<Mob*>(item.actor)->aiStep();
-                }
-                break;
-            case ActorTickPhase::PassengerTick:
-                item.actor->passengerTick();
-                break;
-            default:
-                break;
-            }
-        }
-    } catch (const std::exception& e) {
-        logger().error(
-            "std::exception in actor phase {} dim {}: {}",
-            phaseName(ctx.phase),
-            ctx.dimensionId,
-            e.what()
-        );
-        markFunctionDangerous(phaseName(ctx.phase));
-        mBypassCurrentTick = true;
-    } catch (...) {
-        logger().error(
-            "Unknown exception in actor phase {} dim {}",
-            phaseName(ctx.phase),
-            ctx.dimensionId
-        );
-        markFunctionDangerous(phaseName(ctx.phase));
-        mBypassCurrentTick = true;
-    }
-
-    auto end = std::chrono::steady_clock::now();
-    ctx.lastWorkTimeUs = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::microseconds>(end - start).count()
-    );
-    ctx.lastActorCount = static_cast<uint64_t>(ctx.actorTasks.size());
-
-    updateMax(mStats.maxSingleDimActorTimeUs, ctx.lastWorkTimeUs);
-    tl_currentPhase = "idle";
-}
-
-void ParallelActorTickManager::flushCurrentPhase() {
-    if (mCurrentPhase == ActorTickPhase::None || mCurrentPhaseBuckets.empty()) {
+    if (!mInitialized || !config.parallelNormalTick || !mInLevelTick || isStopping()) {
+        fn();
         return;
     }
 
-    mActiveDispatches.fetch_add(1, std::memory_order_acq_rel);
-    bool dispatchRegistered = true;
+    if (actor.isPlayer()) {
+        fn();
+        return;
+    }
 
-    auto leaveDispatch = [this, &dispatchRegistered]() {
-        if (!dispatchRegistered) {
-            return;
-        }
-        dispatchRegistered = false;
-        mActiveDispatches.fetch_sub(1, std::memory_order_acq_rel);
-        notifyDispatchProgress();
-    };
+    if (isFunctionDangerous(funcName)) {
+        fn();
+        return;
+    }
 
-    std::vector<DimensionWorkerContext*> activeContexts;
-    uint64_t totalActors = 0;
+    const int dimId = static_cast<int>(actor.getDimensionId());
+    auto* ctx = getOrCreateWorker(dimId);
+    if (ctx == nullptr) {
+        fn();
+        return;
+    }
+
+    auto sync = std::make_shared<MainThreadTaskQueue::SyncState>();
 
     {
-        std::lock_guard contextsLock(mContextsMutex);
-
-        for (auto& [dimId, bucket] : mCurrentPhaseBuckets) {
-            if (bucket.items.empty()) {
-                continue;
-            }
-
-            auto it = mContexts.find(dimId);
-            if (it == mContexts.end() || !it->second) {
-                auto newCtx = std::make_unique<DimensionWorkerContext>();
-                auto* raw   = newCtx.get();
-                raw->dimensionId = dimId;
-                raw->workerThread = std::thread(&ParallelActorTickManager::workerLoop, this, raw);
-
-                auto [insertIt, inserted] = mContexts.emplace(dimId, std::move(newCtx));
-                if (!inserted || !insertIt->second) {
-                    if (raw->workerThread.joinable()) {
-                        {
-                            std::lock_guard wakeLock(raw->wakeMutex);
-                            raw->shutdown = true;
-                        }
-                        raw->wakeCV.notify_one();
-                        raw->workerThread.join();
-                    }
-                    leaveDispatch();
-                    clearCurrentPhaseBuckets();
-                    return;
-                }
-                it = insertIt;
-            }
-
-            auto* ctx = it->second.get();
-            ctx->dimensionId = dimId;
-            ctx->phase       = mCurrentPhase;
-            ctx->actorTasks  = std::move(bucket.items);
-            ctx->lastWorkTimeUs = 0;
-            ctx->lastActorCount = 0;
-            ctx->jobCompleted.store(false, std::memory_order_release);
-
-            totalActors += static_cast<uint64_t>(ctx->actorTasks.size());
-            activeContexts.push_back(ctx);
-        }
+        std::lock_guard queueLock(ctx->queueMutex);
+        DimensionWorkerContext::TaskItem task;
+        task.fn = std::move(fn);
+        task.sync = sync;
+        task.debugName = funcName;
+        ctx->tasks.push_back(std::move(task));
     }
+    ctx->wakeCV.notify_one();
 
-    if (activeContexts.empty()) {
-        leaveDispatch();
-        clearCurrentPhaseBuckets();
-        return;
-    }
+    auto waitStart = std::chrono::steady_clock::now();
 
-    const auto dispatchStart = std::chrono::steady_clock::now();
-
-    for (auto* ctx : activeContexts) {
-        {
-            std::lock_guard wakeLock(ctx->wakeMutex);
-            ctx->shouldWork = true;
-        }
-        ctx->wakeCV.notify_one();
-    }
-
-    size_t   remaining = activeContexts.size();
-    uint64_t waitUs    = 0;
-
-    while (remaining > 0) {
+    for (;;) {
         processAllMainThreadTasks();
 
-        for (auto* ctx : activeContexts) {
-            if (ctx != nullptr && ctx->jobCompleted.exchange(false, std::memory_order_acq_rel)) {
-                if (remaining > 0) {
-                    --remaining;
-                }
+        {
+            std::unique_lock lock(sync->mutex);
+            if (sync->cv.wait_for(lock, std::chrono::milliseconds(1), [&sync] { return sync->done; })) {
+                break;
             }
         }
-
-        if (remaining == 0) {
-            break;
-        }
-
-        auto waitStart = std::chrono::steady_clock::now();
-        {
-            std::unique_lock dispatchLock(mDispatchMutex);
-            mDispatchCV.wait_for(dispatchLock, std::chrono::milliseconds(1));
-        }
-        auto waitEnd = std::chrono::steady_clock::now();
-
-        waitUs += static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::microseconds>(waitEnd - waitStart).count()
-        );
     }
 
-    processAllMainThreadTasks();
-
-    uint64_t workUs = 0;
-    for (auto* ctx : activeContexts) {
-        workUs += ctx->lastWorkTimeUs;
-        ctx->actorTasks.clear();
-    }
-
-    const auto dispatchEnd = std::chrono::steady_clock::now();
-    const uint64_t dispatchUs = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::microseconds>(dispatchEnd - dispatchStart).count()
+    auto waitEnd = std::chrono::steady_clock::now();
+    const uint64_t waitUs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(waitEnd - waitStart).count()
     );
+    const uint64_t execUs = ctx->lastTaskTimeUs;
 
-    recordActorPhaseStats(dispatchUs, waitUs, workUs, totalActors);
-    leaveDispatch();
-    clearCurrentPhaseBuckets();
+    recordNormalTickStats(execUs, waitUs);
+
+    if (sync->exception) {
+        try {
+            std::rethrow_exception(sync->exception);
+        } catch (const std::exception& e) {
+            logger().error("Exception in {} on dim {}: {}", funcName, dimId, e.what());
+        } catch (...) {
+            logger().error("Unknown exception in {} on dim {}", funcName, dimId);
+        }
+        markFunctionDangerous(funcName);
+        fn();
+    }
 }
 
-void ParallelActorTickManager::recordActorPhaseStats(
-    uint64_t dispatchUs,
-    uint64_t waitUs,
-    uint64_t workUs,
-    uint64_t actorCount
-) {
-    mStats.totalActorDispatches.fetch_add(1, std::memory_order_relaxed);
-    mStats.totalActorBatches.fetch_add(actorCount, std::memory_order_relaxed);
-    mStats.totalActorDispatchTimeUs.fetch_add(dispatchUs, std::memory_order_relaxed);
-    mStats.totalActorWaitTimeUs.fetch_add(waitUs, std::memory_order_relaxed);
-    mStats.totalActorWorkTimeUs.fetch_add(workUs, std::memory_order_relaxed);
-
-    updateMax(mStats.maxActorDispatchTimeUs, dispatchUs);
-    updateMax(mStats.maxActorWaitTimeUs, waitUs);
-    updateMax(mStats.maxActorWorkTimeUs, workUs);
-
-    mWindowStats.actorDispatches++;
-    mWindowStats.actorBatches += actorCount;
-    mWindowStats.totalActorDispatchTimeUs += dispatchUs;
-    mWindowStats.totalActorWaitTimeUs += waitUs;
-    mWindowStats.totalActorWorkTimeUs += workUs;
-
-    updateMaxValue(mWindowStats.maxActorDispatchTimeUs, dispatchUs);
-    updateMaxValue(mWindowStats.maxActorWaitTimeUs, waitUs);
-    updateMaxValue(mWindowStats.maxActorWorkTimeUs, workUs);
-}
-
-size_t ParallelActorTickManager::processAllMainThreadTasks() {
+size_t ParallelNormalTickManager::processAllMainThreadTasks() {
     auto stats = mMainThreadTasks.processAll();
     if (stats.total > 0) {
         mStats.totalMainThreadTasks.fetch_add(static_cast<uint64_t>(stats.total), std::memory_order_relaxed);
@@ -826,7 +603,23 @@ size_t ParallelActorTickManager::processAllMainThreadTasks() {
     return stats.total;
 }
 
-void ParallelActorTickManager::maybeLogWindowStats() {
+void ParallelNormalTickManager::recordNormalTickStats(uint64_t execUs, uint64_t waitUs) {
+    mStats.totalNormalTickDispatches.fetch_add(1, std::memory_order_relaxed);
+    mStats.totalNormalTickTimeUs.fetch_add(execUs, std::memory_order_relaxed);
+    mStats.totalNormalTickWaitTimeUs.fetch_add(waitUs, std::memory_order_relaxed);
+
+    updateMax(mStats.maxNormalTickTimeUs, execUs);
+    updateMax(mStats.maxNormalTickWaitTimeUs, waitUs);
+
+    mWindowStats.normalTickDispatches++;
+    mWindowStats.totalNormalTickTimeUs += execUs;
+    mWindowStats.totalNormalTickWaitUs += waitUs;
+
+    updateMaxValue(mWindowStats.maxNormalTickTimeUs, execUs);
+    updateMaxValue(mWindowStats.maxNormalTickWaitUs, waitUs);
+}
+
+void ParallelNormalTickManager::maybeLogWindowStats() {
     if (!config.debug) {
         return;
     }
@@ -854,54 +647,37 @@ void ParallelActorTickManager::maybeLogWindowStats() {
         window.maxLevelHookTimeUs
     );
 
-    if (window.actorDispatches > 0) {
-        const uint64_t avgActorDispatchUs = window.totalActorDispatchTimeUs / window.actorDispatches;
-        const uint64_t avgActorWaitUs     = window.totalActorWaitTimeUs / window.actorDispatches;
-        const uint64_t avgActorWorkUs     = window.totalActorWorkTimeUs / window.actorDispatches;
-        const double   actorGain          = window.totalActorDispatchTimeUs > 0
-            ? static_cast<double>(window.totalActorWorkTimeUs) / static_cast<double>(window.totalActorDispatchTimeUs)
-            : 0.0;
+    if (window.normalTickDispatches > 0) {
+        const uint64_t avgExecUs = window.totalNormalTickTimeUs / window.normalTickDispatches;
+        const uint64_t avgWaitUs = window.totalNormalTickWaitUs / window.normalTickDispatches;
 
         logger().info(
-            "  actorPhase={} avgActors={:.2f} dispatch avg={}us max={}us wait avg={}us max={}us",
-            window.actorDispatches,
-            window.actorDispatches > 0
-                ? static_cast<double>(window.actorBatches) / static_cast<double>(window.actorDispatches)
-                : 0.0,
-            avgActorDispatchUs,
-            window.maxActorDispatchTimeUs,
-            avgActorWaitUs,
-            window.maxActorWaitTimeUs
-        );
-
-        logger().info(
-            "  actorWork avg={}us max={}us gain={:.2f}x",
-            avgActorWorkUs,
-            window.maxActorWorkTimeUs,
-            actorGain
+            "  normalTick dispatches={} exec avg={}us max={}us wait avg={}us max={}us",
+            window.normalTickDispatches,
+            avgExecUs,
+            window.maxNormalTickTimeUs,
+            avgWaitUs,
+            window.maxNormalTickWaitUs
         );
     } else {
-        logger().info("  actorPhase=0");
+        logger().info("  normalTick dispatches=0");
     }
 
     logger().info(
-        "  lifetime: levelTicks={} actorDispatches={} actorBatches={} maxLevelHook={}us maxLevelOrigin={}us maxActorDispatch={}us maxActorWork={}us maxSingleDimActor={}us dangerousHits={} recoveryAttempts={} mainTasks={} queue={}",
+        "  lifetime: levelTicks={} normalDispatches={} maxLevelHook={}us maxLevelOrigin={}us maxNormalExec={}us maxNormalWait={}us dangerousHits={} mainTasks={} queue={}",
         mStats.totalLevelTicks.load(std::memory_order_relaxed),
-        mStats.totalActorDispatches.load(std::memory_order_relaxed),
-        mStats.totalActorBatches.load(std::memory_order_relaxed),
+        mStats.totalNormalTickDispatches.load(std::memory_order_relaxed),
         mStats.maxLevelHookTimeUs.load(std::memory_order_relaxed),
         mStats.maxLevelOriginTimeUs.load(std::memory_order_relaxed),
-        mStats.maxActorDispatchTimeUs.load(std::memory_order_relaxed),
-        mStats.maxActorWorkTimeUs.load(std::memory_order_relaxed),
-        mStats.maxSingleDimActorTimeUs.load(std::memory_order_relaxed),
+        mStats.maxNormalTickTimeUs.load(std::memory_order_relaxed),
+        mStats.maxNormalTickWaitTimeUs.load(std::memory_order_relaxed),
         mStats.totalDangerousFunctions.load(std::memory_order_relaxed),
-        mStats.totalRecoveryAttempts.load(std::memory_order_relaxed),
         mStats.totalMainThreadTasks.load(std::memory_order_relaxed),
         mMainThreadTasks.size()
     );
 }
 
-void ParallelActorTickManager::recordLevelTickStats(uint64_t levelOriginUs, uint64_t levelHookUs) {
+void ParallelNormalTickManager::recordLevelTickStats(uint64_t levelOriginUs, uint64_t levelHookUs) {
     mStats.totalLevelTicks.fetch_add(1, std::memory_order_relaxed);
     mStats.totalLevelOriginTimeUs.fetch_add(levelOriginUs, std::memory_order_relaxed);
     mStats.totalLevelHookTimeUs.fetch_add(levelHookUs, std::memory_order_relaxed);
@@ -924,129 +700,36 @@ void ParallelActorTickManager::recordLevelTickStats(uint64_t levelOriginUs, uint
 //=============================================================================
 
 LL_TYPE_INSTANCE_HOOK(
-    ActorBaseTickHook,
-    ll::memory::HookPriority::Normal,
-    Actor,
-    &Actor::$baseTick,
-    void
-) {
-    if (!config.enabled || !config.parallelActorPhase ||
-        ParallelActorTickManager::getInstance().isStopping()) {
-        origin();
-        return;
-    }
-
-    if (tl_replayingActorPhase) {
-        origin();
-        return;
-    }
-
-    if (ParallelActorTickManager::getInstance().interceptActorPhase(
-            *this,
-            ActorTickPhase::BaseTick,
-            false
-        )) {
-        return;
-    }
-
-    const char* funcName = "Actor::baseTick";
-    ScopedPhase phase(funcName);
-    handleSensitiveFunction(funcName, *this, [this]() { origin(); });
-}
-
-LL_TYPE_INSTANCE_HOOK(
     ActorNormalTickHook,
     ll::memory::HookPriority::Normal,
     Actor,
     &Actor::$normalTick,
     void
 ) {
-    if (!config.enabled || !config.parallelActorPhase ||
-        ParallelActorTickManager::getInstance().isStopping()) {
+    if (!config.enabled || !config.parallelNormalTick ||
+        ParallelNormalTickManager::getInstance().isStopping()) {
         origin();
         return;
     }
 
-    if (tl_replayingActorPhase) {
+    if (tl_insideNormalTickChain) {
         origin();
         return;
     }
 
-    if (ParallelActorTickManager::getInstance().interceptActorPhase(
-            *this,
-            ActorTickPhase::NormalTick,
-            false
-        )) {
+    if (this->isPlayer()) {
+        origin();
         return;
     }
 
     const char* funcName = "Actor::normalTick";
     ScopedPhase phase(funcName);
-    handleSensitiveFunction(funcName, *this, [this]() { origin(); });
-}
 
-LL_TYPE_INSTANCE_HOOK(
-    ActorPassengerTickHook,
-    ll::memory::HookPriority::Normal,
-    Actor,
-    &Actor::$passengerTick,
-    void
-) {
-    if (!config.enabled || !config.parallelActorPhase ||
-        ParallelActorTickManager::getInstance().isStopping()) {
-        origin();
-        return;
-    }
-
-    if (tl_replayingActorPhase) {
-        origin();
-        return;
-    }
-
-    if (ParallelActorTickManager::getInstance().interceptActorPhase(
-            *this,
-            ActorTickPhase::PassengerTick,
-            false
-        )) {
-        return;
-    }
-
-    const char* funcName = "Actor::passengerTick";
-    ScopedPhase phase(funcName);
-    handleSensitiveFunction(funcName, *this, [this]() { origin(); });
-}
-
-LL_TYPE_INSTANCE_HOOK(
-    MobBaseTickHook,
-    ll::memory::HookPriority::Normal,
-    Mob,
-    &Mob::$baseTick,
-    void
-) {
-    if (!config.enabled || !config.parallelActorPhase ||
-        ParallelActorTickManager::getInstance().isStopping()) {
-        origin();
-        return;
-    }
-
-    if (tl_replayingActorPhase) {
-        origin();
-        return;
-    }
-
-    Actor& actor = static_cast<Actor&>(*this);
-
-    if (ParallelActorTickManager::getInstance().interceptActorPhase(
-            actor,
-            ActorTickPhase::BaseTick,
-            true
-        )) {
-        return;
-    }
-
-    const char* funcName = "Mob::baseTick";
-    ScopedPhase phase(funcName);
-    handleSensitiveFunction(funcName, actor, [this]() { origin(); });
+    ParallelNormalTickManager::getInstance().runActorNormalTick(
+        *this,
+        funcName,
+        [this]() { origin(); }
+    );
 }
 
 LL_TYPE_INSTANCE_HOOK(
@@ -1056,63 +739,32 @@ LL_TYPE_INSTANCE_HOOK(
     &Mob::$normalTick,
     void
 ) {
-    if (!config.enabled || !config.parallelActorPhase ||
-        ParallelActorTickManager::getInstance().isStopping()) {
+    if (!config.enabled || !config.parallelNormalTick ||
+        ParallelNormalTickManager::getInstance().isStopping()) {
         origin();
         return;
     }
 
-    if (tl_replayingActorPhase) {
+    if (tl_insideNormalTickChain) {
         origin();
         return;
     }
 
     Actor& actor = static_cast<Actor&>(*this);
 
-    if (ParallelActorTickManager::getInstance().interceptActorPhase(
-            actor,
-            ActorTickPhase::NormalTick,
-            true
-        )) {
+    if (actor.isPlayer()) {
+        origin();
         return;
     }
 
     const char* funcName = "Mob::normalTick";
     ScopedPhase phase(funcName);
-    handleSensitiveFunction(funcName, actor, [this]() { origin(); });
-}
 
-LL_TYPE_INSTANCE_HOOK(
-    MobAiStepHook,
-    ll::memory::HookPriority::Normal,
-    Mob,
-    &Mob::$aiStep,
-    void
-) {
-    if (!config.enabled || !config.parallelActorPhase ||
-        ParallelActorTickManager::getInstance().isStopping()) {
-        origin();
-        return;
-    }
-
-    if (tl_replayingActorPhase) {
-        origin();
-        return;
-    }
-
-    Actor& actor = static_cast<Actor&>(*this);
-
-    if (ParallelActorTickManager::getInstance().interceptActorPhase(
-            actor,
-            ActorTickPhase::AiStep,
-            true
-        )) {
-        return;
-    }
-
-    const char* funcName = "Mob::aiStep";
-    ScopedPhase phase(funcName);
-    handleSensitiveFunction(funcName, actor, [this]() { origin(); });
+    ParallelNormalTickManager::getInstance().runActorNormalTick(
+        actor,
+        funcName,
+        [this]() { origin(); }
+    );
 }
 
 // Player 固定主线程
@@ -1185,7 +837,7 @@ LL_TYPE_INSTANCE_HOOK(
     });
 }
 
-// 顶层 tick：只负责开启和结束 actor 调度窗口
+// 顶层 tick：只负责打开/关闭 normalTick 调度窗口
 LL_TYPE_INSTANCE_HOOK(
     LevelTickHook,
     ll::memory::HookPriority::Normal,
@@ -1193,15 +845,15 @@ LL_TYPE_INSTANCE_HOOK(
     &Level::$tick,
     void
 ) {
-    if (!config.enabled || ParallelActorTickManager::getInstance().isStopping()) {
+    if (!config.enabled || ParallelNormalTickManager::getInstance().isStopping()) {
         origin();
         return;
     }
 
-    auto hookStart = std::chrono::steady_clock::now();
+    auto hookStart   = std::chrono::steady_clock::now();
     auto originStart = std::chrono::steady_clock::now();
 
-    auto& manager = ParallelActorTickManager::getInstance();
+    auto& manager = ParallelNormalTickManager::getInstance();
     manager.beginLevelTick(this);
     origin();
     manager.endLevelTick();
@@ -1236,10 +888,10 @@ bool PluginImpl::load() {
     }
 
     logger().info(
-        "DimParallel loaded. enabled={} debug={} actorPhase={}",
+        "DimParallel loaded. enabled={} debug={} parallelNormalTick={}",
         config.enabled,
         config.debug,
-        config.parallelActorPhase
+        config.parallelNormalTick
     );
     return true;
 }
@@ -1248,13 +900,8 @@ bool PluginImpl::enable() {
     if (!hookInstalled) {
         LevelTickHook::hook();
 
-        ActorBaseTickHook::hook();
         ActorNormalTickHook::hook();
-        ActorPassengerTickHook::hook();
-
-        MobBaseTickHook::hook();
         MobNormalTickHook::hook();
-        MobAiStepHook::hook();
 
         PlayerNormalTickHook::hook();
         PlayerAiStepHook::hook();
@@ -1266,14 +913,14 @@ bool PluginImpl::enable() {
         hookInstalled = true;
     }
 
-    ParallelActorTickManager::getInstance().initialize();
+    ParallelNormalTickManager::getInstance().initialize();
     logger().info("DimParallel enabled");
     return true;
 }
 
 bool PluginImpl::disable() {
     config.enabled = false;
-    ParallelActorTickManager::getInstance().shutdown();
+    ParallelNormalTickManager::getInstance().shutdown();
 
     if (hookInstalled) {
         ActorOnPushHook::unhook();
@@ -1283,13 +930,8 @@ bool PluginImpl::disable() {
         PlayerAiStepHook::unhook();
         PlayerNormalTickHook::unhook();
 
-        MobAiStepHook::unhook();
         MobNormalTickHook::unhook();
-        MobBaseTickHook::unhook();
-
-        ActorPassengerTickHook::unhook();
         ActorNormalTickHook::unhook();
-        ActorBaseTickHook::unhook();
 
         LevelTickHook::unhook();
 
