@@ -1,24 +1,28 @@
 #include "ParallelDimensionTick.h"
 
+#include <ll/api/io/LoggerRegistry.h>
 #include <ll/api/memory/Hook.h>
 #include <ll/api/mod/RegisterHelper.h>
-#include <ll/api/io/LoggerRegistry.h>
 
-#include <mc/world/level/Level.h>
-#include <mc/server/ServerLevel.h>
-#include <mc/world/level/dimension/Dimension.h>
-#include <mc/world/level/Tick.h>
-#include <mc/world/level/BlockSource.h>
-#include <mc/world/actor/Actor.h>
+#include <mc/network/LoopbackPacketSender.h>
 #include <mc/network/Packet.h>
 #include <mc/network/PacketSender.h>
-#include <mc/network/LoopbackPacketSender.h>
+#include <mc/server/ServerLevel.h>
+#include <mc/world/actor/Actor.h>
+#include <mc/world/level/BlockSource.h>
+#include <mc/world/level/Level.h>
+#include <mc/world/level/Tick.h>
+#include <mc/world/level/dimension/Dimension.h>
 
 #include <Windows.h>
+
 #include <chrono>
+#include <cstring>
 #include <filesystem>
-#include <algorithm>
+#include <string>
 #include <unordered_set>
+#include <utility>
+#include <vector>
 
 namespace dim_parallel {
 
@@ -27,9 +31,9 @@ static std::shared_ptr<ll::io::Logger> log;
 static bool                            hookInstalled = false;
 
 static thread_local DimensionWorkerContext* tl_currentContext   = nullptr;
-static thread_local bool                   tl_isWorkerThread   = false;
-static thread_local int                    tl_currentDimTypeId = -1;
-static thread_local const char*            tl_currentPhase     = "idle";
+static thread_local bool                    tl_isWorkerThread   = false;
+static thread_local int                     tl_currentDimTypeId = -1;
+static thread_local const char*             tl_currentPhase     = "idle";
 
 static std::atomic<bool>       g_inParallelPhase{false};
 static std::atomic<bool>       g_suppressDimensionTick{false};
@@ -37,9 +41,34 @@ static std::vector<Dimension*> g_collectedDimensions;
 static std::mutex              g_collectMutex;
 
 static std::unordered_set<std::string> g_dangerousFunctions;
-static std::mutex                       g_dangerousMutex;
+static std::mutex                      g_dangerousMutex;
 
 MainThreadTaskQueue ParallelDimensionTickManager::mMainThreadTasks;
+
+namespace {
+
+class ScopedPhase {
+public:
+    explicit ScopedPhase(const char* phase) noexcept : mPrev(tl_currentPhase) { tl_currentPhase = phase; }
+    ~ScopedPhase() noexcept { tl_currentPhase = mPrev; }
+
+private:
+    const char* mPrev;
+};
+
+class ScopedAtomicFlag {
+public:
+    explicit ScopedAtomicFlag(std::atomic<bool>& flag, bool value = true) noexcept : mFlag(flag) {
+        mFlag.store(value, std::memory_order_release);
+    }
+
+    ~ScopedAtomicFlag() noexcept { mFlag.store(false, std::memory_order_release); }
+
+private:
+    std::atomic<bool>& mFlag;
+};
+
+} // namespace
 
 Config& getConfig() { return config; }
 
@@ -62,18 +91,55 @@ bool saveConfig() {
 
 void MainThreadTaskQueue::enqueue(std::function<void()> task) {
     std::lock_guard lock(mMutex);
-    mTasks.push_back(std::move(task));
+    mTasks.push_back(TaskItem{std::move(task), nullptr});
 }
 
-void MainThreadTaskQueue::processAll() {
+std::shared_ptr<MainThreadTaskQueue::SyncState> MainThreadTaskQueue::enqueueSync(std::function<void()> task) {
+    auto sync = std::make_shared<SyncState>();
+    {
+        std::lock_guard lock(mMutex);
+        mTasks.push_back(TaskItem{std::move(task), sync});
+    }
+    return sync;
+}
+
+size_t MainThreadTaskQueue::processAll() {
     {
         std::lock_guard lock(mMutex);
         mProcessing.swap(mTasks);
     }
-    for (auto& task : mProcessing) {
-        task();
+
+    const size_t count = mProcessing.size();
+
+    for (auto& item : mProcessing) {
+        std::exception_ptr taskException;
+
+        try {
+            item.fn();
+        } catch (...) {
+            taskException = std::current_exception();
+        }
+
+        if (item.sync) {
+            {
+                std::lock_guard syncLock(item.sync->mutex);
+                item.sync->done      = true;
+                item.sync->exception = taskException;
+            }
+            item.sync->cv.notify_one();
+        } else if (taskException) {
+            try {
+                std::rethrow_exception(taskException);
+            } catch (const std::exception& e) {
+                logger().error("Exception in main-thread task: {}", e.what());
+            } catch (...) {
+                logger().error("Unknown exception in main-thread task");
+            }
+        }
     }
+
     mProcessing.clear();
+    return count;
 }
 
 size_t MainThreadTaskQueue::size() const {
@@ -91,49 +157,75 @@ ParallelDimensionTickManager& ParallelDimensionTickManager::getInstance() {
 }
 
 void ParallelDimensionTickManager::initialize() {
-    if (mInitialized) return;
-    mFallbackToSerial = false;
+    if (mInitialized) {
+        return;
+    }
+
+    mFallbackToSerial.store(false, std::memory_order_release);
     mFallbackStartTick = 0;
-    mInitialized = true;
+    mInitialized       = true;
+
     logger().info("Initialized per-dimension thread model, recovery interval = {} ticks", RECOVERY_INTERVAL_TICKS);
 }
 
 void ParallelDimensionTickManager::shutdown() {
-    if (!mInitialized) return;
+    if (!mInitialized) {
+        return;
+    }
+
+    processAllMainThreadTasks();
 
     for (auto& [id, ctx] : mContexts) {
         if (ctx->workerThread.joinable()) {
             {
                 std::lock_guard lock(ctx->wakeMutex);
-                ctx->shutdown = true;
+                ctx->shutdown   = true;
                 ctx->shouldWork = false;
             }
             ctx->wakeCV.notify_one();
             ctx->workerThread.join();
         }
     }
+
     mContexts.clear();
     mInitialized = false;
     logger().info("Shutdown");
 }
 
 bool ParallelDimensionTickManager::isWorkerThread() { return tl_isWorkerThread; }
+
 DimensionWorkerContext* ParallelDimensionTickManager::getCurrentContext() { return tl_currentContext; }
+
 DimensionType ParallelDimensionTickManager::getCurrentDimensionType() { return DimensionType(tl_currentDimTypeId); }
 
+void ParallelDimensionTickManager::notifyDispatchProgress() {
+    mDispatchCV.notify_one();
+}
+
 void ParallelDimensionTickManager::runOnMainThread(std::function<void()> task) {
-    if (!tl_isWorkerThread || !tl_currentContext) {
+    if (!tl_isWorkerThread || tl_currentContext == nullptr) {
         task();
         return;
     }
-    mMainThreadTasks.enqueue(std::move(task));
+
+    auto& manager = getInstance();
+    auto  sync    = mMainThreadTasks.enqueueSync(std::move(task));
+
+    manager.notifyDispatchProgress();
+
+    std::unique_lock lock(sync->mutex);
+    sync->cv.wait(lock, [&sync] { return sync->done; });
+
+    if (sync->exception) {
+        std::rethrow_exception(sync->exception);
+    }
 }
 
 void ParallelDimensionTickManager::markFunctionDangerous(const std::string& funcName) {
     std::lock_guard lock(g_dangerousMutex);
     if (g_dangerousFunctions.insert(funcName).second) {
         logger().warn("Function '{}' marked as dangerous (will run on main thread from now on)", funcName);
-        getInstance().mStats.totalDangerousFunctions++;
+        getInstance().mStats.totalDangerousFunctions.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
@@ -143,56 +235,67 @@ bool ParallelDimensionTickManager::isFunctionDangerous(const std::string& funcNa
 }
 
 void ParallelDimensionTickManager::workerLoop(DimensionWorkerContext* ctx) {
-    tl_isWorkerThread  = true;
-    tl_currentContext  = ctx;
-    tl_currentDimTypeId = ctx->dimension->getDimensionId();
+    tl_isWorkerThread   = true;
+    tl_currentContext   = ctx;
+    tl_currentDimTypeId = -1;
+    tl_currentPhase     = "idle";
 
     while (true) {
         std::unique_lock lock(ctx->wakeMutex);
         ctx->wakeCV.wait(lock, [ctx] { return ctx->shouldWork || ctx->shutdown; });
-        if (ctx->shutdown) break;
+
+        if (ctx->shutdown) {
+            break;
+        }
+
         ctx->shouldWork = false;
         lock.unlock();
 
-        tickDimensionOnWorker(*ctx);
+        if (ctx->dimension != nullptr) {
+            tickDimensionOnWorker(*ctx);
+        }
 
-        ctx->tickCompleted = true;
+        ctx->tickCompleted.store(true, std::memory_order_release);
+        notifyDispatchProgress();
     }
 
-    tl_isWorkerThread  = false;
-    tl_currentContext  = nullptr;
+    tl_isWorkerThread   = false;
+    tl_currentContext   = nullptr;
     tl_currentDimTypeId = -1;
+    tl_currentPhase     = "idle";
 }
 
-void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
+void ParallelDimensionTickManager::dispatchAndSync(Level* level, std::vector<Dimension*> dimensions) {
+    if (dimensions.empty()) {
+        return;
+    }
+
     if (!level || !mInitialized) {
-        std::vector<Dimension*> dims;
-        level->forEachDimension([&](Dimension& dim) -> bool {
-            dims.push_back(&dim);
-            return true;
-        });
-        serialFallbackTick(dims);
+        serialFallbackTick(dimensions);
         return;
     }
 
     mSnapshot.time      = level->getTime();
     mSnapshot.simPaused = level->getSimPaused();
-    if (mSnapshot.simPaused) return;
 
-    auto& dimensions = g_collectedDimensions;
-    if (dimensions.empty()) return;
+    if (mSnapshot.simPaused) {
+        return;
+    }
 
     if (dimensions.size() == 1) {
         dimensions[0]->tick();
         return;
     }
 
-    if (mFallbackToSerial.load(std::memory_order_acquire)) {
-        uint64_t currentTick = level->getTime();
+    const uint64_t currentTick = static_cast<uint64_t>(mSnapshot.time);
+    bool           fallbackBeforeDispatch = mFallbackToSerial.load(std::memory_order_acquire);
+
+    if (fallbackBeforeDispatch) {
         if (currentTick - mFallbackStartTick >= RECOVERY_INTERVAL_TICKS) {
-            mStats.totalRecoveryAttempts++;
+            mStats.totalRecoveryAttempts.fetch_add(1, std::memory_order_relaxed);
             logger().debug("Attempting recovery from fallback mode at tick {}", currentTick);
             mFallbackToSerial.store(false, std::memory_order_release);
+            fallbackBeforeDispatch = false;
         } else {
             serialFallbackTick(dimensions);
             return;
@@ -200,68 +303,69 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
     }
 
     for (auto* dim : dimensions) {
-        int dimId = dim->getDimensionId();
-        auto it = mContexts.find(dimId);
+        const int dimId = dim->getDimensionId();
+        auto      it    = mContexts.find(dimId);
+
         if (it == mContexts.end()) {
             auto ctx = std::make_unique<DimensionWorkerContext>();
-            ctx->dimension = dim;
-            ctx->tickCompleted = false;
-            ctx->shutdown = false;
-            ctx->shouldWork = false;
+            ctx->tickCompleted.store(false, std::memory_order_release);
             ctx->workerThread = std::thread(&ParallelDimensionTickManager::workerLoop, this, ctx.get());
-            mContexts[dimId] = std::move(ctx);
-            it = mContexts.find(dimId);
-        } else {
-            it->second->dimension = dim;
+            mContexts.emplace(dimId, std::move(ctx));
         }
     }
 
-    std::atomic<int> pendingCount(dimensions.size());
     for (auto* dim : dimensions) {
-        int dimId = dim->getDimensionId();
-        auto& ctx = mContexts[dimId];
-        ctx->tickCompleted = false;
+        auto& ctx = mContexts[dim->getDimensionId()];
         {
             std::lock_guard lock(ctx->wakeMutex);
+            ctx->dimension = dim;
+            ctx->tickCompleted.store(false, std::memory_order_release);
             ctx->shouldWork = true;
         }
         ctx->wakeCV.notify_one();
     }
 
-    while (pendingCount.load(std::memory_order_relaxed) > 0) {
+    size_t remaining = dimensions.size();
+
+    while (remaining > 0) {
+        processAllMainThreadTasks();
+
         for (auto* dim : dimensions) {
-            int dimId = dim->getDimensionId();
-            auto& ctx = mContexts[dimId];
-            if (ctx->tickCompleted.load(std::memory_order_acquire)) {
-                bool expected = true;
-                if (ctx->tickCompleted.compare_exchange_strong(expected, false)) {
-                    pendingCount.fetch_sub(1, std::memory_order_relaxed);
+            auto& ctx = mContexts[dim->getDimensionId()];
+            if (ctx->tickCompleted.exchange(false, std::memory_order_acq_rel)) {
+                if (remaining > 0) {
+                    --remaining;
                 }
             }
         }
-        if (pendingCount.load() > 0) {
-            std::this_thread::yield();
+
+        if (remaining == 0) {
+            break;
         }
+
+        std::unique_lock dispatchLock(mDispatchMutex);
+        mDispatchCV.wait_for(dispatchLock, std::chrono::milliseconds(1));
     }
 
     processAllMainThreadTasks();
 
-    if (mFallbackToSerial.load(std::memory_order_acquire)) {
-        mFallbackStartTick = level->getTime();
+    if (!fallbackBeforeDispatch && mFallbackToSerial.load(std::memory_order_acquire)) {
+        mFallbackStartTick = currentTick;
     }
 
-    mStats.totalParallelTicks++;
+    mStats.totalParallelTicks.fetch_add(1, std::memory_order_relaxed);
 
-    if (config.debug && (mStats.totalParallelTicks % 200 == 0)) {
+    if (config.debug && (mStats.totalParallelTicks.load(std::memory_order_relaxed) % 200 == 0)) {
         logger().info(
             "Parallel tick #{}: dims={}  mainTasks={}  fallbacks={}  dangerous={}  recoveryAttempts={}",
-            mStats.totalParallelTicks.load(),
+            mStats.totalParallelTicks.load(std::memory_order_relaxed),
             dimensions.size(),
-            mStats.totalMainThreadTasks.load(),
-            mStats.totalFallbackTicks.load(),
-            mStats.totalDangerousFunctions.load(),
-            mStats.totalRecoveryAttempts.load()
+            mStats.totalMainThreadTasks.load(std::memory_order_relaxed),
+            mStats.totalFallbackTicks.load(std::memory_order_relaxed),
+            mStats.totalDangerousFunctions.load(std::memory_order_relaxed),
+            mStats.totalRecoveryAttempts.load(std::memory_order_relaxed)
         );
+
         for (auto& [id, ctx] : mContexts) {
             logger().info("  dim[{}]: {}us", id, ctx->lastTickTimeUs);
         }
@@ -269,9 +373,9 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
 }
 
 void ParallelDimensionTickManager::tickDimensionOnWorker(DimensionWorkerContext& ctx) {
-    tl_isWorkerThread  = true;
+    tl_isWorkerThread   = true;
     tl_currentContext   = &ctx;
-    tl_currentDimTypeId = ctx.dimension->getDimensionId();
+    tl_currentDimTypeId = (ctx.dimension != nullptr) ? ctx.dimension->getDimensionId() : -1;
     tl_currentPhase     = "pre-tick";
 
     auto start = std::chrono::steady_clock::now();
@@ -281,18 +385,24 @@ void ParallelDimensionTickManager::tickDimensionOnWorker(DimensionWorkerContext&
         tl_currentPhase = "tick";
         ctx.dimension->tick();
         tl_currentPhase = "post-tick";
-    } catch (std::exception& e) {
+    } catch (const std::exception& e) {
         exceptionOccurred = true;
         logger().error("std::exception in dim {} during [{}]: {}", tl_currentDimTypeId, tl_currentPhase, e.what());
-        if (tl_currentPhase != nullptr && tl_currentPhase[0] != '\0' && 
-            strcmp(tl_currentPhase, "pre-tick") != 0 && strcmp(tl_currentPhase, "post-tick") != 0) {
+
+        if (tl_currentPhase != nullptr && tl_currentPhase[0] != '\0' &&
+            std::strcmp(tl_currentPhase, "pre-tick") != 0 &&
+            std::strcmp(tl_currentPhase, "post-tick") != 0 &&
+            std::strcmp(tl_currentPhase, "tick") != 0) {
             markFunctionDangerous(tl_currentPhase);
         }
     } catch (...) {
         exceptionOccurred = true;
-        logger().error("SEH/unknown exception in dim {} during [{}]", tl_currentDimTypeId, tl_currentPhase);
-        if (tl_currentPhase != nullptr && tl_currentPhase[0] != '\0' && 
-            strcmp(tl_currentPhase, "pre-tick") != 0 && strcmp(tl_currentPhase, "post-tick") != 0) {
+        logger().error("Unknown exception in dim {} during [{}]", tl_currentDimTypeId, tl_currentPhase);
+
+        if (tl_currentPhase != nullptr && tl_currentPhase[0] != '\0' &&
+            std::strcmp(tl_currentPhase, "pre-tick") != 0 &&
+            std::strcmp(tl_currentPhase, "post-tick") != 0 &&
+            std::strcmp(tl_currentPhase, "tick") != 0) {
             markFunctionDangerous(tl_currentPhase);
         }
     }
@@ -301,53 +411,61 @@ void ParallelDimensionTickManager::tickDimensionOnWorker(DimensionWorkerContext&
         mFallbackToSerial.store(true, std::memory_order_release);
     }
 
-    auto end           = std::chrono::steady_clock::now();
-    ctx.lastTickTimeUs = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+    const auto end = std::chrono::steady_clock::now();
+    ctx.lastTickTimeUs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(end - start).count()
+    );
 
     uint64_t expected = mStats.maxDimTickTimeUs.load(std::memory_order_relaxed);
     while (ctx.lastTickTimeUs > expected) {
-        if (mStats.maxDimTickTimeUs.compare_exchange_weak(expected, ctx.lastTickTimeUs)) break;
+        if (mStats.maxDimTickTimeUs.compare_exchange_weak(expected, ctx.lastTickTimeUs, std::memory_order_relaxed)) {
+            break;
+        }
     }
 
-    tl_isWorkerThread  = false;
+    tl_isWorkerThread   = false;
     tl_currentContext   = nullptr;
     tl_currentDimTypeId = -1;
     tl_currentPhase     = "idle";
 }
 
-void ParallelDimensionTickManager::processAllMainThreadTasks() {
-    size_t count = mMainThreadTasks.size();
-    mMainThreadTasks.processAll();
-    mStats.totalMainThreadTasks += static_cast<uint64_t>(count);
+size_t ParallelDimensionTickManager::processAllMainThreadTasks() {
+    const size_t count = mMainThreadTasks.processAll();
+    if (count > 0) {
+        mStats.totalMainThreadTasks.fetch_add(static_cast<uint64_t>(count), std::memory_order_relaxed);
+    }
+    return count;
 }
 
-void ParallelDimensionTickManager::serialFallbackTick(std::vector<Dimension*>& dimensions) {
+void ParallelDimensionTickManager::serialFallbackTick(const std::vector<Dimension*>& dimensions) {
     for (auto* dim : dimensions) {
-        dim->tick();
+        if (dim != nullptr) {
+            dim->tick();
+        }
     }
-    mStats.totalFallbackTicks++;
+    mStats.totalFallbackTicks.fetch_add(1, std::memory_order_relaxed);
 }
 
 //=============================================================================
 // Helper template for dangerous function forwarding
 //=============================================================================
 
-template<typename Func, typename... Args>
-inline void handleDangerousFunction(const char* funcName, Func&& func, Args&&... args) {
+template <typename Func>
+inline void handleDangerousFunction(const char* funcName, Func&& func) {
     if (!config.enabled) {
-        std::forward<Func>(func)(std::forward<Args>(args)...);
+        std::forward<Func>(func)();
         return;
     }
-    if (ParallelDimensionTickManager::isWorkerThread()) {
-        if (ParallelDimensionTickManager::isFunctionDangerous(funcName)) {
-            ParallelDimensionTickManager::runOnMainThread([funcName, func = std::forward<Func>(func), 
-                                                           ...capturedArgs = std::forward<Args>(args)]() mutable {
-                func(std::forward<decltype(capturedArgs)>(capturedArgs)...);
-            });
-            return;
-        }
+
+    if (ParallelDimensionTickManager::isWorkerThread() &&
+        ParallelDimensionTickManager::isFunctionDangerous(funcName)) {
+        ParallelDimensionTickManager::runOnMainThread(
+            [forwarded = std::forward<Func>(func)]() mutable { forwarded(); }
+        );
+        return;
     }
-    std::forward<Func>(func)(std::forward<Args>(args)...);
+
+    std::forward<Func>(func)();
 }
 
 //=============================================================================
@@ -362,7 +480,7 @@ LL_TYPE_INSTANCE_HOOK(
     void
 ) {
     const char* funcName = "tickRedstone";
-    tl_currentPhase = funcName;
+    ScopedPhase phase(funcName);
     handleDangerousFunction(funcName, [this]() { origin(); });
 }
 
@@ -374,7 +492,7 @@ LL_TYPE_INSTANCE_HOOK(
     void
 ) {
     const char* funcName = "_sendBlocksChangedPackets";
-    tl_currentPhase = funcName;
+    ScopedPhase phase(funcName);
     handleDangerousFunction(funcName, [this]() { origin(); });
 }
 
@@ -386,7 +504,7 @@ LL_TYPE_INSTANCE_HOOK(
     void
 ) {
     const char* funcName = "_processEntityChunkTransfers";
-    tl_currentPhase = funcName;
+    ScopedPhase phase(funcName);
     handleDangerousFunction(funcName, [this]() { origin(); });
 }
 
@@ -398,7 +516,7 @@ LL_TYPE_INSTANCE_HOOK(
     void
 ) {
     const char* funcName = "_tickEntityChunkMoves";
-    tl_currentPhase = funcName;
+    ScopedPhase phase(funcName);
     handleDangerousFunction(funcName, [this]() { origin(); });
 }
 
@@ -410,7 +528,7 @@ LL_TYPE_INSTANCE_HOOK(
     void
 ) {
     const char* funcName = "_runChunkGenerationWatchdog";
-    tl_currentPhase = funcName;
+    ScopedPhase phase(funcName);
     handleDangerousFunction(funcName, [this]() { origin(); });
 }
 
@@ -423,9 +541,13 @@ LL_TYPE_INSTANCE_HOOK(
     Packet const& packet,
     Player*       except
 ) {
-    const char* funcName = "sendBroadcast";
-    tl_currentPhase = funcName;
-    handleDangerousFunction(funcName, [this, &packet, except]() { origin(packet, except); });
+    const char*  funcName  = "sendBroadcast";
+    ScopedPhase  phase(funcName);
+    auto*        packetPtr = &packet;
+
+    handleDangerousFunction(funcName, [this, packetPtr, except]() {
+        origin(*packetPtr, except);
+    });
 }
 
 LL_TYPE_INSTANCE_HOOK(
@@ -438,9 +560,14 @@ LL_TYPE_INSTANCE_HOOK(
     Packet const&   packet,
     Player const*   except
 ) {
-    const char* funcName = "sendPacketForPosition";
-    tl_currentPhase = funcName;
-    handleDangerousFunction(funcName, [this, &position, &packet, except]() { origin(position, packet, except); });
+    const char* funcName    = "sendPacketForPosition";
+    ScopedPhase phase(funcName);
+    auto*       positionPtr = &position;
+    auto*       packetPtr   = &packet;
+
+    handleDangerousFunction(funcName, [this, positionPtr, packetPtr, except]() {
+        origin(*positionPtr, *packetPtr, except);
+    });
 }
 
 LL_TYPE_INSTANCE_HOOK(
@@ -453,9 +580,14 @@ LL_TYPE_INSTANCE_HOOK(
     Packet const& packet,
     Player const* except
 ) {
-    const char* funcName = "sendPacketForEntity";
-    tl_currentPhase = funcName;
-    handleDangerousFunction(funcName, [this, &actor, &packet, except]() { origin(actor, packet, except); });
+    const char* funcName  = "sendPacketForEntity";
+    ScopedPhase phase(funcName);
+    auto*       actorPtr  = &actor;
+    auto*       packetPtr = &packet;
+
+    handleDangerousFunction(funcName, [this, actorPtr, packetPtr, except]() {
+        origin(*actorPtr, *packetPtr, except);
+    });
 }
 
 LL_TYPE_INSTANCE_HOOK(
@@ -469,15 +601,13 @@ LL_TYPE_INSTANCE_HOOK(
         origin();
         return;
     }
+
     if (g_suppressDimensionTick.load(std::memory_order_acquire)) {
         std::lock_guard lock(g_collectMutex);
         g_collectedDimensions.push_back(this);
         return;
     }
-    if (g_inParallelPhase.load(std::memory_order_acquire)) {
-        origin();
-        return;
-    }
+
     origin();
 }
 
@@ -497,11 +627,11 @@ LL_TYPE_INSTANCE_HOOK(
         std::lock_guard lock(g_collectMutex);
         g_collectedDimensions.clear();
     }
-    g_suppressDimensionTick.store(true, std::memory_order_release);
 
-    origin();
-
-    g_suppressDimensionTick.store(false, std::memory_order_release);
+    {
+        ScopedAtomicFlag suppress(g_suppressDimensionTick, true);
+        origin();
+    }
 
     std::vector<Dimension*> dims;
     {
@@ -510,9 +640,8 @@ LL_TYPE_INSTANCE_HOOK(
     }
 
     if (!dims.empty()) {
-        g_inParallelPhase.store(true, std::memory_order_release);
-        ParallelDimensionTickManager::getInstance().dispatchAndSync(this);
-        g_inParallelPhase.store(false, std::memory_order_release);
+        ScopedAtomicFlag parallel(g_inParallelPhase, true);
+        ParallelDimensionTickManager::getInstance().dispatchAndSync(this, std::move(dims));
     }
 }
 
@@ -527,10 +656,12 @@ PluginImpl& PluginImpl::getInstance() {
 
 bool PluginImpl::load() {
     std::filesystem::create_directories(getSelf().getConfigDir());
+
     if (!loadConfig()) {
         logger().warn("Failed to load config, using defaults");
         saveConfig();
     }
+
     logger().info("DimParallel loaded. enabled={} debug={}", config.enabled, config.debug);
     return true;
 }
@@ -549,6 +680,7 @@ bool PluginImpl::enable() {
         DimensionSendPacketForEntityHook::hook();
         hookInstalled = true;
     }
+
     ParallelDimensionTickManager::getInstance().initialize();
     logger().info("DimParallel enabled");
     return true;
@@ -556,6 +688,7 @@ bool PluginImpl::enable() {
 
 bool PluginImpl::disable() {
     ParallelDimensionTickManager::getInstance().shutdown();
+
     if (hookInstalled) {
         LevelTickHook::unhook();
         DimensionTickHook::unhook();
@@ -569,6 +702,7 @@ bool PluginImpl::disable() {
         DimensionSendPacketForEntityHook::unhook();
         hookInstalled = false;
     }
+
     logger().info("DimParallel disabled");
     return true;
 }
