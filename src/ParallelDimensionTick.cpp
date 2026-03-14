@@ -68,37 +68,6 @@ private:
     std::atomic<bool>& mFlag;
 };
 
-class ActiveDispatchGuard {
-public:
-    explicit ActiveDispatchGuard(ParallelDimensionTickManager& manager) noexcept
-        : mManager(manager) {
-        if (mManager.isStopping()) {
-            return;
-        }
-        mManager.getStats(); // keep object referenced
-        mManager.mActiveDispatches.fetch_add(1, std::memory_order_acq_rel);
-        if (mManager.isStopping()) {
-            mManager.mActiveDispatches.fetch_sub(1, std::memory_order_acq_rel);
-            return;
-        }
-        mActive = true;
-    }
-
-    ~ActiveDispatchGuard() noexcept {
-        if (!mActive) {
-            return;
-        }
-        mManager.mActiveDispatches.fetch_sub(1, std::memory_order_acq_rel);
-        mManager.notifyDispatchProgress();
-    }
-
-    bool active() const noexcept { return mActive; }
-
-private:
-    ParallelDimensionTickManager& mManager;
-    bool                          mActive = false;
-};
-
 } // namespace
 
 Config& getConfig() { return config; }
@@ -333,12 +302,6 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level, std::vector<Dim
         return;
     }
 
-    ActiveDispatchGuard dispatchGuard(*this);
-    if (!dispatchGuard.active()) {
-        serialFallbackTick(dimensions);
-        return;
-    }
-
     mSnapshot.time      = level->getTime();
     mSnapshot.simPaused = level->getSimPaused();
 
@@ -348,6 +311,24 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level, std::vector<Dim
 
     if (dimensions.size() == 1) {
         dimensions[0]->tick();
+        return;
+    }
+
+    mActiveDispatches.fetch_add(1, std::memory_order_acq_rel);
+    bool dispatchRegistered = true;
+
+    auto leaveDispatch = [this, &dispatchRegistered]() {
+        if (!dispatchRegistered) {
+            return;
+        }
+        dispatchRegistered = false;
+        mActiveDispatches.fetch_sub(1, std::memory_order_acq_rel);
+        notifyDispatchProgress();
+    };
+
+    if (isStopping()) {
+        leaveDispatch();
+        serialFallbackTick(dimensions);
         return;
     }
 
@@ -361,6 +342,7 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level, std::vector<Dim
             mFallbackToSerial.store(false, std::memory_order_release);
             fallbackBeforeDispatch = false;
         } else {
+            leaveDispatch();
             serialFallbackTick(dimensions);
             return;
         }
@@ -397,6 +379,7 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level, std::vector<Dim
                         raw->wakeCV.notify_one();
                         raw->workerThread.join();
                     }
+                    leaveDispatch();
                     serialFallbackTick(dimensions);
                     return;
                 }
@@ -409,12 +392,14 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level, std::vector<Dim
     }
 
     if (activeContexts.empty()) {
+        leaveDispatch();
         return;
     }
 
     for (auto* ctx : activeContexts) {
         if (ctx == nullptr) {
             mFallbackToSerial.store(true, std::memory_order_release);
+            leaveDispatch();
             serialFallbackTick(dimensions);
             return;
         }
@@ -441,10 +426,6 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level, std::vector<Dim
         }
 
         if (remaining == 0) {
-            break;
-        }
-
-        if (isStopping()) {
             break;
         }
 
@@ -478,6 +459,8 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level, std::vector<Dim
             }
         }
     }
+
+    leaveDispatch();
 }
 
 void ParallelDimensionTickManager::tickDimensionOnWorker(DimensionWorkerContext& ctx) {
