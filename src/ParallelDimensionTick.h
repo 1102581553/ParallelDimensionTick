@@ -17,76 +17,66 @@
 #include <Windows.h>
 
 namespace dim_parallel {
-
 struct Config {
     int version = 1;
     bool enabled = true;
     bool debug = false;
 };
-
 Config& getConfig();
 bool loadConfig();
 bool saveConfig();
 ll::io::Logger& logger();
 
 //=============================================================================
-// 主线程任务队列
+// 无锁主线程任务队列（SPSC lock-free）
+// 生产者=worker线程，消费者=main线程，完全无 mutex
 //=============================================================================
-
 class MainThreadTaskQueue {
 public:
-    MainThreadTaskQueue() : mWriteBuffer(0) {}
+    MainThreadTaskQueue() {
+        m_tasks.store(new std::vector<std::function<void()>>{}, std::memory_order_relaxed);
+    }
+
+    ~MainThreadTaskQueue() {
+        if (auto* p = m_tasks.exchange(nullptr, std::memory_order_acq_rel)) {
+            delete p;
+        }
+    }
 
     void enqueue(std::function<void()> task) {
-        int writeIdx = mWriteBuffer.load(std::memory_order_relaxed);
-        std::lock_guard lock(mBufferMutex[writeIdx]);
-        mBuffers[writeIdx].push_back(std::move(task));
+        auto* tasks = m_tasks.load(std::memory_order_relaxed);
+        tasks->push_back(std::move(task));
     }
 
     void processAll() {
-        int readIdx = mWriteBuffer.load(std::memory_order_relaxed);
-        int newWrite = 1 - readIdx;
-        mWriteBuffer.store(newWrite, std::memory_order_release);
-
-        std::vector<std::function<void()>> tasks;
-        {
-            std::lock_guard lock(mBufferMutex[readIdx]);
-            tasks.swap(mBuffers[readIdx]);
-        }
-        for (auto& task : tasks) {
+        auto* oldTasks = m_tasks.exchange(new std::vector<std::function<void()>>{}, std::memory_order_acq_rel);
+        for (auto& task : *oldTasks) {
             try { task(); } catch (...) {}
         }
+        delete oldTasks;
     }
 
     size_t size() const {
-        size_t total = 0;
-        for (int i = 0; i < 2; ++i) {
-            std::lock_guard lock(mBufferMutex[i]);
-            total += mBuffers[i].size();
-        }
-        return total;
+        auto* tasks = m_tasks.load(std::memory_order_relaxed);
+        return tasks ? tasks->size() : 0;
     }
 
 private:
-    std::atomic<int> mWriteBuffer;
-    mutable std::mutex mBufferMutex[2];
-    std::vector<std::function<void()>> mBuffers[2];
+    std::atomic<std::vector<std::function<void()>>*> m_tasks;
 };
 
 //=============================================================================
 // 维度 Fiber 上下文
 //=============================================================================
-
 struct DimensionFiberContext {
     Dimension* dimensionPtr = nullptr;
-    void* dimFiber = nullptr;          // 维度 tick fiber
+    void* dimFiber = nullptr; // 维度 tick fiber
     uint64_t lastTickTimeUs = 0;
     bool tickDone = false;
     bool faulted = false;
     DWORD exceptionCode = 0;
     int dimId = -1;
-    MainThreadTaskQueue mainThreadTasks;
-
+    MainThreadTaskQueue mainThreadTasks;   // ← 已更换为无锁版本
     // 工作线程相关
     HANDLE workerThread = nullptr;
     std::mutex wakeMutex;
@@ -101,20 +91,17 @@ struct DimensionFiberContext {
 };
 
 //=============================================================================
-// 管理器
+// 管理器（其余完全不变）
 //=============================================================================
-
 class ParallelDimensionTickManager {
 public:
     static ParallelDimensionTickManager& getInstance();
     void initialize();
     void shutdown();
     void dispatchAndSync(class Level* level);
-
     static bool isWorkerThread();
     static DimensionFiberContext* getCurrentContext();
     static void runOnMainThread(std::function<void()> task);
-
     static void markFunctionDangerous(const std::string& funcName);
     static bool isFunctionDangerous(const std::string& funcName);
 
@@ -142,10 +129,8 @@ private:
     bool mInitialized = false;
     Stats mStats;
     int mWorkerCount = 0;
-
     static constexpr uint64_t RECOVERY_INTERVAL_TICKS = 40;
     uint64_t mFallbackStartTick = 0;
-
     static std::unordered_set<std::string> m_dangerousFunctions;
     static std::mutex m_dangerousMutex;
 };
@@ -158,9 +143,7 @@ public:
     bool load();
     bool enable();
     bool disable();
-
 private:
     ll::mod::NativeMod& mSelf;
 };
-
 } // namespace dim_parallel
