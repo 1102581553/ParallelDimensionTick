@@ -42,20 +42,20 @@ public:
         std::exception_ptr      exception;
     };
 
-    void                            enqueue(std::function<void()> task);
-    std::shared_ptr<SyncState>      enqueueSync(std::function<void()> task);
-    size_t                          processAll();
-    size_t                          size() const;
+    void                       enqueue(std::function<void()> task);
+    std::shared_ptr<SyncState> enqueueSync(std::function<void()> task);
+    size_t                     processAll();
+    size_t                     size() const;
 
 private:
     struct TaskItem {
-        std::function<void()>   fn;
+        std::function<void()>    fn;
         std::shared_ptr<SyncState> sync;
     };
 
-    mutable std::mutex      mMutex;
-    std::vector<TaskItem>   mTasks;
-    std::vector<TaskItem>   mProcessing;
+    mutable std::mutex    mMutex;
+    std::vector<TaskItem> mTasks;
+    std::vector<TaskItem> mProcessing;
 };
 
 struct LevelTickSnapshot {
@@ -64,15 +64,15 @@ struct LevelTickSnapshot {
 };
 
 struct DimensionWorkerContext {
-    Dimension*               dimension      = nullptr;
-    uint64_t                 lastTickTimeUs = 0;
+    Dimension*              dimension      = nullptr;
+    uint64_t                lastTickTimeUs = 0;
 
-    std::thread              workerThread;
-    std::mutex               wakeMutex;
-    std::condition_variable  wakeCV;
-    bool                     shouldWork = false;
-    bool                     shutdown   = false;
-    std::atomic<bool>        tickCompleted{false};
+    std::thread             workerThread;
+    std::mutex              wakeMutex;
+    std::condition_variable wakeCV;
+    bool                    shouldWork = false;
+    bool                    shutdown   = false;
+    std::atomic<bool>       tickCompleted{false};
 };
 
 class ParallelDimensionTickManager {
@@ -105,11 +105,11 @@ public:
 private:
     ParallelDimensionTickManager() = default;
 
-    void     tickDimensionOnWorker(DimensionWorkerContext& ctx);
-    size_t   processAllMainThreadTasks();
-    void     serialFallbackTick(const std::vector<Dimension*>& dimensions);
-    void     workerLoop(DimensionWorkerContext* ctx);
-    void     notifyDispatchProgress();
+    void   tickDimensionOnWorker(DimensionWorkerContext& ctx);
+    size_t processAllMainThreadTasks();
+    void   serialFallbackTick(const std::vector<Dimension*>& dimensions);
+    void   workerLoop(DimensionWorkerContext* ctx);
+    void   notifyDispatchProgress();
 
     std::unordered_map<int, std::unique_ptr<DimensionWorkerContext>> mContexts;
     LevelTickSnapshot                                                mSnapshot;
@@ -117,8 +117,8 @@ private:
     bool                                                             mInitialized = false;
     Stats                                                            mStats;
 
-    std::mutex               mDispatchMutex;
-    std::condition_variable  mDispatchCV;
+    std::mutex              mDispatchMutex;
+    std::condition_variable mDispatchCV;
 
     static MainThreadTaskQueue mMainThreadTasks;
 
