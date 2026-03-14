@@ -27,9 +27,9 @@ bool loadConfig();
 bool saveConfig();
 ll::io::Logger& logger();
 
+
 //=============================================================================
-// 无锁主线程任务队列（SPSC lock-free）
-// 生产者=worker线程，消费者=main线程，完全无 mutex
+// 主线程任务队列（带互斥锁保护）
 //=============================================================================
 class MainThreadTaskQueue {
 public:
@@ -43,26 +43,37 @@ public:
         }
     }
 
+    // 修复：添加互斥锁保护 push_back 操作
     void enqueue(std::function<void()> task) {
+        std::lock_guard<std::mutex> lock(m_enqueueMutex);  // ← 关键修复
         auto* tasks = m_tasks.load(std::memory_order_relaxed);
-        tasks->push_back(std::move(task));
+        if (tasks) {
+            tasks->push_back(std::move(task));
+        }
     }
 
     void processAll() {
+        // 主线程独占消费，无需锁（但需确保交换操作的原子性）
         auto* oldTasks = m_tasks.exchange(new std::vector<std::function<void()>>{}, std::memory_order_acq_rel);
-        for (auto& task : *oldTasks) {
-            try { task(); } catch (...) {}
+        if (oldTasks) {
+            for (auto& task : *oldTasks) {
+                try { task(); } catch (...) {
+                    logger().error("主线程任务执行异常");
+                }
+            }
+            delete oldTasks;
         }
-        delete oldTasks;
     }
 
     size_t size() const {
+        std::lock_guard<std::mutex> lock(m_enqueueMutex);  // ← 保护 size() 避免与 push_back 竞争
         auto* tasks = m_tasks.load(std::memory_order_relaxed);
         return tasks ? tasks->size() : 0;
     }
 
 private:
     std::atomic<std::vector<std::function<void()>>*> m_tasks;
+    mutable std::mutex m_enqueueMutex;  // ← 新增互斥锁
 };
 
 //=============================================================================
