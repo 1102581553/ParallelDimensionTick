@@ -4,25 +4,16 @@
 #include <ll/api/memory/Hook.h>
 #include <ll/api/mod/RegisterHelper.h>
 
-#include <mc/network/LoopbackPacketSender.h>
-#include <mc/network/Packet.h>
-#include <mc/network/PacketSender.h>
-#include <mc/server/ServerLevel.h>
 #include <mc/world/actor/Actor.h>
 #include <mc/world/actor/Mob.h>
 #include <mc/world/actor/player/Player.h>
-#include <mc/world/level/BlockSource.h>
 #include <mc/world/level/Level.h>
 #include <mc/world/level/Tick.h>
 #include <mc/world/level/dimension/Dimension.h>
 
-#include <Windows.h>
-
 #include <bit>
 #include <chrono>
-#include <cstring>
 #include <filesystem>
-#include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -34,11 +25,11 @@ static Config                           config;
 static std::shared_ptr<ll::io::Logger> log;
 static bool                             hookInstalled = false;
 
-static thread_local DimensionWorkerContext* tl_currentContext   = nullptr;
-static thread_local bool                    tl_isWorkerThread   = false;
+static thread_local DimensionWorkerContext* tl_currentContext      = nullptr;
+static thread_local bool                    tl_isWorkerThread      = false;
 static thread_local bool                    tl_replayingActorPhase = false;
-static thread_local int                     tl_currentDimTypeId = -1;
-static thread_local const char*             tl_currentPhase     = "idle";
+static thread_local int                     tl_currentDimTypeId    = -1;
+static thread_local const char*             tl_currentPhase        = "idle";
 
 static std::atomic<bool>       g_suppressDimensionTick{false};
 static std::atomic<bool>       g_suppressActorTicks{false};
@@ -46,8 +37,8 @@ static std::vector<Dimension*> g_collectedDimensions;
 static std::mutex              g_collectDimensionMutex;
 
 struct CollectedActorBucket {
-    std::vector<ActorWorkItem>            items;
-    std::unordered_map<Actor*, size_t>    index;
+    std::vector<ActorWorkItem>         items;
+    std::unordered_map<Actor*, size_t> index;
 };
 
 static std::unordered_map<int, CollectedActorBucket> g_collectedActors;
@@ -215,23 +206,7 @@ inline std::unordered_map<int, std::vector<ActorWorkItem>> takeCollectedActors()
 }
 
 template <typename Func>
-inline void handleDangerousFunction(const char* funcName, Func&& func) {
-    if (!config.enabled) {
-        std::forward<Func>(func)();
-        return;
-    }
-
-    if (ParallelDimensionTickManager::isWorkerThread() &&
-        ParallelDimensionTickManager::isFunctionDangerous(funcName)) {
-        forwardToMainThread(std::forward<Func>(func));
-        return;
-    }
-
-    std::forward<Func>(func)();
-}
-
-template <typename Func>
-inline void handleActorSensitiveFunction(const char* funcName, Actor& actor, Func&& func) {
+inline void handleSensitiveFunction(const char* funcName, Actor& actor, Func&& func) {
     if (!config.enabled) {
         std::forward<Func>(func)();
         return;
@@ -393,7 +368,7 @@ size_t MainThreadTaskQueue::size() const {
 }
 
 //=============================================================================
-// ParallelDimensionTickManager implementation
+// ParallelDimensionTickManager
 //=============================================================================
 
 ParallelDimensionTickManager& ParallelDimensionTickManager::getInstance() {
@@ -427,7 +402,7 @@ void ParallelDimensionTickManager::initialize() {
     mInitialized = true;
 
     logger().info(
-        "Initialized dual-phase parallel model. actorPhase={} dimensionPhase={} recovery={} debugWindow={}",
+        "Initialized dual-phase model. actorPhase={} dimensionPhase={} recovery={} debugWindow={}",
         config.parallelActorPhase,
         config.parallelDimensionPhase,
         RECOVERY_INTERVAL_TICKS,
@@ -527,16 +502,8 @@ void ParallelDimensionTickManager::markFunctionDangerous(const std::string& func
             recoverAt,
             nowTick
         );
-    } else {
-        if (it->second < recoverAt) {
-            it->second = recoverAt;
-        }
-        logger().warn(
-            "Function '{}' danger window extended to tick {} (current tick = {})",
-            funcName,
-            it->second,
-            nowTick
-        );
+    } else if (it->second < recoverAt) {
+        it->second = recoverAt;
     }
 
     manager.mStats.totalDangerousFunctions.fetch_add(1, std::memory_order_relaxed);
@@ -610,7 +577,6 @@ void ParallelDimensionTickManager::processActorPhaseOnWorker(DimensionWorkerCont
     tl_currentPhase     = "actor-phase";
 
     auto start = std::chrono::steady_clock::now();
-
     uint64_t phaseCalls = 0;
 
     for (auto& item : ctx.actorTasks) {
@@ -642,11 +608,10 @@ void ParallelDimensionTickManager::processActorPhaseOnWorker(DimensionWorkerCont
             }
 
             if (item.isMob && (item.phaseMask & ActorPhaseMask::MobAiStep) != ActorPhaseMask::None) {
-                if (auto* mob = static_cast<Mob*>(item.actor); mob != nullptr) {
-                    ScopedPhase phase("Mob::aiStep");
-                    mob->aiStep();
-                    ++phaseCalls;
-                }
+                auto* mob = static_cast<Mob*>(item.actor);
+                ScopedPhase phase("Mob::aiStep");
+                mob->aiStep();
+                ++phaseCalls;
             }
 
             if ((item.phaseMask & ActorPhaseMask::PassengerTick) != ActorPhaseMask::None) {
@@ -693,15 +658,13 @@ void ParallelDimensionTickManager::tickDimensionOnWorker(DimensionWorkerContext&
     tl_currentDimTypeId = (ctx.dimension != nullptr)
         ? static_cast<int>(ctx.dimension->getDimensionId())
         : ctx.dimensionId;
-    tl_currentPhase = "pre-dimension-tick";
+    tl_currentPhase = "Dimension::tick";
 
     auto start = std::chrono::steady_clock::now();
     bool exceptionOccurred = false;
 
     try {
-        tl_currentPhase = "Dimension::tick";
         ctx.dimension->tick();
-        tl_currentPhase = "post-dimension-tick";
     } catch (const std::exception& e) {
         exceptionOccurred = true;
         logger().error(
@@ -710,21 +673,11 @@ void ParallelDimensionTickManager::tickDimensionOnWorker(DimensionWorkerContext&
             tl_currentPhase,
             e.what()
         );
-
-        if (tl_currentPhase != nullptr && tl_currentPhase[0] != '\0' &&
-            std::strcmp(tl_currentPhase, "pre-dimension-tick") != 0 &&
-            std::strcmp(tl_currentPhase, "post-dimension-tick") != 0) {
-            markFunctionDangerous(tl_currentPhase);
-        }
+        markFunctionDangerous("Dimension::tick");
     } catch (...) {
         exceptionOccurred = true;
         logger().error("Unknown exception in dim {} during [{}]", tl_currentDimTypeId, tl_currentPhase);
-
-        if (tl_currentPhase != nullptr && tl_currentPhase[0] != '\0' &&
-            std::strcmp(tl_currentPhase, "pre-dimension-tick") != 0 &&
-            std::strcmp(tl_currentPhase, "post-dimension-tick") != 0) {
-            markFunctionDangerous(tl_currentPhase);
-        }
+        markFunctionDangerous("Dimension::tick");
     }
 
     if (exceptionOccurred) {
@@ -737,7 +690,6 @@ void ParallelDimensionTickManager::tickDimensionOnWorker(DimensionWorkerContext&
     );
 
     updateMax(mStats.maxSingleDimTickTimeUs, ctx.lastDimensionTickTimeUs);
-
     tl_currentPhase = "idle";
 }
 
@@ -1321,126 +1273,8 @@ void ParallelDimensionTickManager::serialFallbackDimensionTick(const std::vector
 }
 
 //=============================================================================
-// Hooks: dimension side
+// Hooks: Dimension
 //=============================================================================
-
-LL_TYPE_INSTANCE_HOOK(
-    DimensionTickRedstoneHook,
-    ll::memory::HookPriority::Normal,
-    Dimension,
-    &Dimension::$tickRedstone,
-    void
-) {
-    const char* funcName = "Dimension::tickRedstone";
-    ScopedPhase phase(funcName);
-    handleDangerousFunction(funcName, [this]() { origin(); });
-}
-
-LL_TYPE_INSTANCE_HOOK(
-    DimensionSendBlocksChangedHook,
-    ll::memory::HookPriority::Normal,
-    Dimension,
-    &Dimension::_sendBlocksChangedPackets,
-    void
-) {
-    const char* funcName = "Dimension::_sendBlocksChangedPackets";
-    ScopedPhase phase(funcName);
-    handleDangerousFunction(funcName, [this]() { origin(); });
-}
-
-LL_TYPE_INSTANCE_HOOK(
-    DimensionProcessEntityTransfersHook,
-    ll::memory::HookPriority::Normal,
-    Dimension,
-    &Dimension::_processEntityChunkTransfers,
-    void
-) {
-    const char* funcName = "Dimension::_processEntityChunkTransfers";
-    ScopedPhase phase(funcName);
-    handleDangerousFunction(funcName, [this]() { origin(); });
-}
-
-LL_TYPE_INSTANCE_HOOK(
-    DimensionTickEntityChunkMovesHook,
-    ll::memory::HookPriority::Normal,
-    Dimension,
-    &Dimension::_tickEntityChunkMoves,
-    void
-) {
-    const char* funcName = "Dimension::_tickEntityChunkMoves";
-    ScopedPhase phase(funcName);
-    handleDangerousFunction(funcName, [this]() { origin(); });
-}
-
-LL_TYPE_INSTANCE_HOOK(
-    DimensionRunChunkGenWatchdogHook,
-    ll::memory::HookPriority::Normal,
-    Dimension,
-    &Dimension::_runChunkGenerationWatchdog,
-    void
-) {
-    const char* funcName = "Dimension::_runChunkGenerationWatchdog";
-    ScopedPhase phase(funcName);
-    handleDangerousFunction(funcName, [this]() { origin(); });
-}
-
-LL_TYPE_INSTANCE_HOOK(
-    DimensionSendBroadcastHook,
-    ll::memory::HookPriority::Normal,
-    Dimension,
-    &Dimension::$sendBroadcast,
-    void,
-    Packet const& packet,
-    Player*       except
-) {
-    const char* funcName = "Dimension::sendBroadcast";
-    ScopedPhase phase(funcName);
-    auto* packetPtr = &packet;
-
-    handleDangerousFunction(funcName, [this, packetPtr, except]() {
-        origin(*packetPtr, except);
-    });
-}
-
-LL_TYPE_INSTANCE_HOOK(
-    DimensionSendPacketForPositionHook,
-    ll::memory::HookPriority::Normal,
-    Dimension,
-    &Dimension::$sendPacketForPosition,
-    void,
-    BlockPos const& position,
-    Packet const&   packet,
-    Player const*   except
-) {
-    const char* funcName = "Dimension::sendPacketForPosition";
-    ScopedPhase phase(funcName);
-    auto* positionPtr = &position;
-    auto* packetPtr   = &packet;
-
-    handleDangerousFunction(funcName, [this, positionPtr, packetPtr, except]() {
-        origin(*positionPtr, *packetPtr, except);
-    });
-}
-
-LL_TYPE_INSTANCE_HOOK(
-    DimensionSendPacketForEntityHook,
-    ll::memory::HookPriority::Normal,
-    Dimension,
-    &Dimension::$sendPacketForEntity,
-    void,
-    Actor const&   actor,
-    Packet const&  packet,
-    Player const*  except
-) {
-    const char* funcName = "Dimension::sendPacketForEntity";
-    ScopedPhase phase(funcName);
-    auto* actorPtr  = &actor;
-    auto* packetPtr = &packet;
-
-    handleDangerousFunction(funcName, [this, actorPtr, packetPtr, except]() {
-        origin(*actorPtr, *packetPtr, except);
-    });
-}
 
 LL_TYPE_INSTANCE_HOOK(
     DimensionTickHook,
@@ -1465,7 +1299,7 @@ LL_TYPE_INSTANCE_HOOK(
 }
 
 //=============================================================================
-// Hooks: actor collection / replay
+// Hooks: Actor / Mob collection
 //=============================================================================
 
 LL_TYPE_INSTANCE_HOOK(
@@ -1493,7 +1327,7 @@ LL_TYPE_INSTANCE_HOOK(
 
     const char* funcName = "Actor::baseTick";
     ScopedPhase phase(funcName);
-    handleActorSensitiveFunction(funcName, *this, [this]() { origin(); });
+    handleSensitiveFunction(funcName, *this, [this]() { origin(); });
 }
 
 LL_TYPE_INSTANCE_HOOK(
@@ -1521,7 +1355,7 @@ LL_TYPE_INSTANCE_HOOK(
 
     const char* funcName = "Actor::normalTick";
     ScopedPhase phase(funcName);
-    handleActorSensitiveFunction(funcName, *this, [this]() { origin(); });
+    handleSensitiveFunction(funcName, *this, [this]() { origin(); });
 }
 
 LL_TYPE_INSTANCE_HOOK(
@@ -1549,7 +1383,7 @@ LL_TYPE_INSTANCE_HOOK(
 
     const char* funcName = "Actor::passengerTick";
     ScopedPhase phase(funcName);
-    handleActorSensitiveFunction(funcName, *this, [this]() { origin(); });
+    handleSensitiveFunction(funcName, *this, [this]() { origin(); });
 }
 
 LL_TYPE_INSTANCE_HOOK(
@@ -1579,7 +1413,7 @@ LL_TYPE_INSTANCE_HOOK(
 
     const char* funcName = "Mob::baseTick";
     ScopedPhase phase(funcName);
-    handleActorSensitiveFunction(funcName, actor, [this]() { origin(); });
+    handleSensitiveFunction(funcName, actor, [this]() { origin(); });
 }
 
 LL_TYPE_INSTANCE_HOOK(
@@ -1609,7 +1443,7 @@ LL_TYPE_INSTANCE_HOOK(
 
     const char* funcName = "Mob::normalTick";
     ScopedPhase phase(funcName);
-    handleActorSensitiveFunction(funcName, actor, [this]() { origin(); });
+    handleSensitiveFunction(funcName, actor, [this]() { origin(); });
 }
 
 LL_TYPE_INSTANCE_HOOK(
@@ -1639,11 +1473,11 @@ LL_TYPE_INSTANCE_HOOK(
 
     const char* funcName = "Mob::aiStep";
     ScopedPhase phase(funcName);
-    handleActorSensitiveFunction(funcName, actor, [this]() { origin(); });
+    handleSensitiveFunction(funcName, actor, [this]() { origin(); });
 }
 
 //=============================================================================
-// Hooks: player remains main-thread
+// Hooks: Player stays on main thread
 //=============================================================================
 
 LL_TYPE_INSTANCE_HOOK(
@@ -1698,7 +1532,7 @@ LL_TYPE_INSTANCE_HOOK(
 }
 
 //=============================================================================
-// Hooks: actor sensitive operations always guarded
+// Hooks: Actor interaction guard
 //=============================================================================
 
 LL_TYPE_INSTANCE_HOOK(
@@ -1718,56 +1552,8 @@ LL_TYPE_INSTANCE_HOOK(
     });
 }
 
-LL_TYPE_INSTANCE_HOOK(
-    ActorHandleInsidePortalHook,
-    ll::memory::HookPriority::Normal,
-    Actor,
-    &Actor::$handleInsidePortal,
-    void,
-    BlockPos const& portalPos
-) {
-    const char* funcName = "Actor::handleInsidePortal";
-    ScopedPhase phase(funcName);
-    auto* posPtr = &portalPos;
-
-    handleActorSensitiveFunction(funcName, *this, [this, posPtr]() {
-        origin(*posPtr);
-    });
-}
-
-LL_TYPE_INSTANCE_HOOK(
-    ActorChangeDimensionHook,
-    ll::memory::HookPriority::Normal,
-    Actor,
-    &Actor::$changeDimension,
-    void,
-    DimensionType toId
-) {
-    const char* funcName = "Actor::changeDimension";
-    ScopedPhase phase(funcName);
-
-    handleActorSensitiveFunction(funcName, *this, [this, toId]() {
-        origin(toId);
-    });
-}
-
-LL_TYPE_INSTANCE_HOOK(
-    ActorSendMotionPacketIfNeededHook,
-    ll::memory::HookPriority::Normal,
-    Actor,
-    &Actor::$sendMotionPacketIfNeeded,
-    void
-) {
-    const char* funcName = "Actor::sendMotionPacketIfNeeded";
-    ScopedPhase phase(funcName);
-
-    handleActorSensitiveFunction(funcName, *this, [this]() {
-        origin();
-    });
-}
-
 //=============================================================================
-// Hook: top-level level tick
+// Hook: Level top-level tick
 //=============================================================================
 
 LL_TYPE_INSTANCE_HOOK(
@@ -1838,7 +1624,7 @@ LL_TYPE_INSTANCE_HOOK(
 }
 
 //=============================================================================
-// Plugin Implementation
+// Plugin
 //=============================================================================
 
 PluginImpl& PluginImpl::getInstance() {
@@ -1869,15 +1655,6 @@ bool PluginImpl::enable() {
         LevelTickHook::hook();
         DimensionTickHook::hook();
 
-        DimensionTickRedstoneHook::hook();
-        DimensionSendBlocksChangedHook::hook();
-        DimensionProcessEntityTransfersHook::hook();
-        DimensionTickEntityChunkMovesHook::hook();
-        DimensionRunChunkGenWatchdogHook::hook();
-        DimensionSendBroadcastHook::hook();
-        DimensionSendPacketForPositionHook::hook();
-        DimensionSendPacketForEntityHook::hook();
-
         ActorBaseTickHook::hook();
         ActorNormalTickHook::hook();
         ActorPassengerTickHook::hook();
@@ -1892,9 +1669,6 @@ bool PluginImpl::enable() {
         PlayerTickWorldHook::hook();
 
         ActorOnPushHook::hook();
-        ActorHandleInsidePortalHook::hook();
-        ActorChangeDimensionHook::hook();
-        ActorSendMotionPacketIfNeededHook::hook();
 
         hookInstalled = true;
     }
@@ -1909,9 +1683,6 @@ bool PluginImpl::disable() {
     ParallelDimensionTickManager::getInstance().shutdown();
 
     if (hookInstalled) {
-        ActorSendMotionPacketIfNeededHook::unhook();
-        ActorChangeDimensionHook::unhook();
-        ActorHandleInsidePortalHook::unhook();
         ActorOnPushHook::unhook();
 
         PlayerTickWorldHook::unhook();
@@ -1926,15 +1697,6 @@ bool PluginImpl::disable() {
         ActorPassengerTickHook::unhook();
         ActorNormalTickHook::unhook();
         ActorBaseTickHook::unhook();
-
-        DimensionSendPacketForEntityHook::unhook();
-        DimensionSendPacketForPositionHook::unhook();
-        DimensionSendBroadcastHook::unhook();
-        DimensionRunChunkGenWatchdogHook::unhook();
-        DimensionTickEntityChunkMovesHook::unhook();
-        DimensionProcessEntityTransfersHook::unhook();
-        DimensionSendBlocksChangedHook::unhook();
-        DimensionTickRedstoneHook::unhook();
 
         DimensionTickHook::unhook();
         LevelTickHook::unhook();
