@@ -133,6 +133,41 @@ public:
 
         std::atomic<uint64_t> totalMainThreadTaskProcessTimeUs{0};
         std::atomic<uint64_t> maxMainThreadTaskProcessTimeUs{0};
+
+        void reset() noexcept {
+            totalLevelTicks.store(0, std::memory_order_relaxed);
+            totalParallelTicks.store(0, std::memory_order_relaxed);
+            totalFallbackTicks.store(0, std::memory_order_relaxed);
+
+            totalMainThreadTasks.store(0, std::memory_order_relaxed);
+            totalMainThreadSyncTasks.store(0, std::memory_order_relaxed);
+            totalMainThreadAsyncTasks.store(0, std::memory_order_relaxed);
+
+            totalRecoveryAttempts.store(0, std::memory_order_relaxed);
+            totalDangerousFunctions.store(0, std::memory_order_relaxed);
+
+            totalLevelOriginTimeUs.store(0, std::memory_order_relaxed);
+            maxLevelOriginTimeUs.store(0, std::memory_order_relaxed);
+
+            totalLevelHookTimeUs.store(0, std::memory_order_relaxed);
+            maxLevelHookTimeUs.store(0, std::memory_order_relaxed);
+
+            totalDispatchTimeUs.store(0, std::memory_order_relaxed);
+            maxDispatchTimeUs.store(0, std::memory_order_relaxed);
+
+            totalDispatchWaitTimeUs.store(0, std::memory_order_relaxed);
+            maxDispatchWaitTimeUs.store(0, std::memory_order_relaxed);
+
+            totalAllDimTickTimeUs.store(0, std::memory_order_relaxed);
+            maxAllDimTickTimeUs.store(0, std::memory_order_relaxed);
+            maxDimTickTimeUs.store(0, std::memory_order_relaxed);
+
+            totalFallbackTimeUs.store(0, std::memory_order_relaxed);
+            maxFallbackTimeUs.store(0, std::memory_order_relaxed);
+
+            totalMainThreadTaskProcessTimeUs.store(0, std::memory_order_relaxed);
+            maxMainThreadTaskProcessTimeUs.store(0, std::memory_order_relaxed);
+        }
     };
 
     Stats& getStats() { return mStats; }
