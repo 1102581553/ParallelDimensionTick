@@ -1,4 +1,5 @@
 #pragma once
+
 #include <ll/api/Config.h>
 #include <ll/api/io/Logger.h>
 #include <ll/api/mod/NativeMod.h>
@@ -14,6 +15,7 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace dim_parallel {
@@ -22,6 +24,7 @@ struct Config {
     int  version = 1;
     bool enabled = true;
     bool debug   = false;
+    // Recovery interval hardcoded to 20 ticks (1 second)
 };
 
 Config&         getConfig();
@@ -47,35 +50,16 @@ struct LevelTickSnapshot {
 };
 
 struct DimensionWorkerContext {
-    Dimension*          dimension = nullptr;
-    MainThreadTaskQueue mainThreadTasks;
-    uint64_t            lastTickTimeUs = 0;
-};
+    Dimension* dimension = nullptr;
+    uint64_t   lastTickTimeUs = 0;
 
-class WorkerPool {
-public:
-    void start(int numWorkers);
-    void stop();
-    void executeAll(std::vector<std::function<void()>>& tasks);
-    int  workerCount() const { return static_cast<int>(mHandles.size()); }
-
-private:
-    static unsigned long __stdcall threadEntry(void* param);
-    void workerLoop();
-
-    struct Batch {
-        std::function<void()>* tasks    = nullptr;
-        int                    count    = 0;
-        std::atomic<int>       nextIdx{0};
-        std::atomic<int>       doneCount{0};
-    };
-
-    std::vector<void*>       mHandles;
-    std::mutex               mMutex;
-    std::condition_variable  mWakeCV;
-    Batch                    mBatch;
-    uint64_t                 mGeneration = 0;
-    bool                     mShutdown   = false;
+    // Per-dimension thread resources
+    std::thread                 workerThread;
+    std::mutex                  wakeMutex;
+    std::condition_variable     wakeCV;
+    bool                        shouldWork = false;
+    bool                        shutdown   = false;
+    std::atomic<bool>           tickCompleted{false};
 };
 
 class ParallelDimensionTickManager {
@@ -91,13 +75,17 @@ public:
     static DimensionType           getCurrentDimensionType();
     static void                    runOnMainThread(std::function<void()> task);
 
-    WorkerPool& getWorkerPool() { return mPool; }
+    // Record a function that caused an exception in worker thread
+    static void markFunctionDangerous(const std::string& funcName);
+    static bool isFunctionDangerous(const std::string& funcName);
 
     struct Stats {
         std::atomic<uint64_t> totalParallelTicks{0};
         std::atomic<uint64_t> totalFallbackTicks{0};
         std::atomic<uint64_t> totalMainThreadTasks{0};
         std::atomic<uint64_t> maxDimTickTimeUs{0};
+        std::atomic<uint64_t> totalRecoveryAttempts{0};
+        std::atomic<uint64_t> totalDangerousFunctions{0};  // Number of functions marked dangerous
     };
     Stats& getStats() { return mStats; }
 
@@ -107,13 +95,20 @@ private:
     void tickDimensionOnWorker(DimensionWorkerContext& ctx);
     void processAllMainThreadTasks();
     void serialFallbackTick(std::vector<Dimension*>& dimensions);
+    void workerLoop(DimensionWorkerContext* ctx);
 
-    std::unordered_map<int, DimensionWorkerContext> mContexts;
+    std::unordered_map<int, std::unique_ptr<DimensionWorkerContext>> mContexts;
     LevelTickSnapshot                               mSnapshot;
-    WorkerPool                                      mPool;
     std::atomic<bool>                               mFallbackToSerial{false};
-    bool                                            mInitialized = false;
-    Stats                                           mStats;
+    bool                                             mInitialized = false;
+    Stats                                            mStats;
+
+    // Global main thread task queue (static for access from static methods)
+    static MainThreadTaskQueue                       mMainThreadTasks;
+
+    // Recovery mechanism
+    static constexpr uint64_t                        RECOVERY_INTERVAL_TICKS = 20; // 1 second at 20 tps
+    uint64_t                                          mFallbackStartTick = 0;
 };
 
 class PluginImpl {
