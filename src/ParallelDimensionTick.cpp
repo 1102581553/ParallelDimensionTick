@@ -326,12 +326,10 @@ LL_TYPE_INSTANCE_HOOK(
         origin();
         return;
     }
-    tl_currentPhase = "tickRedstone";
-    try { origin(); }
-    catch (...) {
-        logger().error("Exception in dim {} during tickRedstone", tl_currentDimTypeId);
-        throw;
-    }
+    // 提交到主线程执行
+    ParallelDimensionTickManager::runOnMainThread([this]() {
+        this->origin();
+    });
 }
 
 LL_TYPE_INSTANCE_HOOK(
@@ -345,12 +343,9 @@ LL_TYPE_INSTANCE_HOOK(
         origin();
         return;
     }
-    tl_currentPhase = "_sendBlocksChangedPackets";
-    try { origin(); }
-    catch (...) {
-        logger().error("Exception in dim {} during _sendBlocksChangedPackets", tl_currentDimTypeId);
-        throw;
-    }
+    ParallelDimensionTickManager::runOnMainThread([this]() {
+        this->origin();
+    });
 }
 
 LL_TYPE_INSTANCE_HOOK(
@@ -364,12 +359,9 @@ LL_TYPE_INSTANCE_HOOK(
         origin();
         return;
     }
-    tl_currentPhase = "_processEntityChunkTransfers";
-    try { origin(); }
-    catch (...) {
-        logger().error("Exception in dim {} during _processEntityChunkTransfers", tl_currentDimTypeId);
-        throw;
-    }
+    ParallelDimensionTickManager::runOnMainThread([this]() {
+        this->origin();
+    });
 }
 
 LL_TYPE_INSTANCE_HOOK(
@@ -383,12 +375,9 @@ LL_TYPE_INSTANCE_HOOK(
         origin();
         return;
     }
-    tl_currentPhase = "_tickEntityChunkMoves";
-    try { origin(); }
-    catch (...) {
-        logger().error("Exception in dim {} during _tickEntityChunkMoves", tl_currentDimTypeId);
-        throw;
-    }
+    ParallelDimensionTickManager::runOnMainThread([this]() {
+        this->origin();
+    });
 }
 
 LL_TYPE_INSTANCE_HOOK(
@@ -402,9 +391,9 @@ LL_TYPE_INSTANCE_HOOK(
         origin();
         return;
     }
-    Dimension* self = this;
-    ParallelDimensionTickManager::runOnMainThread([self]() {
-        self->_runChunkGenerationWatchdog();
+    // 已经走主线程
+    ParallelDimensionTickManager::runOnMainThread([this]() {
+        this->origin();
     });
 }
 
@@ -444,7 +433,10 @@ LL_TYPE_INSTANCE_HOOK(
         origin(packet, except);
         return;
     }
-    origin(packet, except);
+    // 提交到主线程，注意捕获参数（引用捕获，需确保生命周期）
+    ParallelDimensionTickManager::runOnMainThread([this, &packet, except]() {
+        this->origin(packet, except);
+    });
 }
 
 LL_TYPE_INSTANCE_HOOK(
@@ -461,7 +453,10 @@ LL_TYPE_INSTANCE_HOOK(
         origin(position, packet, except);
         return;
     }
-    origin(position, packet, except);
+    // 按值捕获 position（可复制），packet 仍为引用
+    ParallelDimensionTickManager::runOnMainThread([this, position, &packet, except]() {
+        this->origin(position, packet, except);
+    });
 }
 
 LL_TYPE_INSTANCE_HOOK(
@@ -478,7 +473,10 @@ LL_TYPE_INSTANCE_HOOK(
         origin(actor, packet, except);
         return;
     }
-    origin(actor, packet, except);
+    // 捕获引用，需保证 actor 和 packet 在任务执行时有效
+    ParallelDimensionTickManager::runOnMainThread([this, &actor, &packet, except]() {
+        this->origin(actor, packet, except);
+    });
 }
 
 LL_TYPE_INSTANCE_HOOK(
