@@ -1,4 +1,4 @@
-#pragma once
+#pragma once 
 
 #include <ll/api/Config.h>
 #include <ll/api/io/Logger.h>
@@ -24,7 +24,6 @@ struct Config {
     int  version = 1;
     bool enabled = true;
     bool debug   = false;
-    // Recovery interval hardcoded to 20 ticks (1 second)
 };
 
 Config&         getConfig();
@@ -53,7 +52,6 @@ struct DimensionWorkerContext {
     Dimension* dimension = nullptr;
     uint64_t   lastTickTimeUs = 0;
 
-    // Per-dimension thread resources
     std::thread                 workerThread;
     std::mutex                  wakeMutex;
     std::condition_variable     wakeCV;
@@ -75,7 +73,6 @@ public:
     static DimensionType           getCurrentDimensionType();
     static void                    runOnMainThread(std::function<void()> task);
 
-    // Record a function that caused an exception in worker thread
     static void markFunctionDangerous(const std::string& funcName);
     static bool isFunctionDangerous(const std::string& funcName);
 
@@ -85,7 +82,7 @@ public:
         std::atomic<uint64_t> totalMainThreadTasks{0};
         std::atomic<uint64_t> maxDimTickTimeUs{0};
         std::atomic<uint64_t> totalRecoveryAttempts{0};
-        std::atomic<uint64_t> totalDangerousFunctions{0};  // Number of functions marked dangerous
+        std::atomic<uint64_t> totalDangerousFunctions{0};
     };
     Stats& getStats() { return mStats; }
 
@@ -103,11 +100,9 @@ private:
     bool                                             mInitialized = false;
     Stats                                            mStats;
 
-    // Global main thread task queue (static for access from static methods)
     static MainThreadTaskQueue                       mMainThreadTasks;
 
-    // Recovery mechanism
-    static constexpr uint64_t                        RECOVERY_INTERVAL_TICKS = 20; // 1 second at 20 tps
+    static constexpr uint64_t                        RECOVERY_INTERVAL_TICKS = 20;
     uint64_t                                          mFallbackStartTick = 0;
 };
 
