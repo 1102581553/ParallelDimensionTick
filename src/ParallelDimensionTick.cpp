@@ -4,15 +4,13 @@
 #include <ll/api/memory/Hook.h>
 #include <ll/api/mod/RegisterHelper.h>
 
-#include <mc/network/LoopbackPacketSender.h>
 #include <mc/network/Packet.h>
-#include <mc/network/PacketSender.h>
-#include <mc/server/ServerLevel.h>
 #include <mc/world/actor/Actor.h>
+#include <mc/world/actor/Mob.h>
+#include <mc/world/actor/player/Player.h>
 #include <mc/world/level/BlockSource.h>
 #include <mc/world/level/Level.h>
 #include <mc/world/level/Tick.h>
-#include <mc/world/level/chunk/LevelChunk.h>
 #include <mc/world/level/dimension/Dimension.h>
 
 #include <Windows.h>
@@ -21,7 +19,7 @@
 #include <cstring>
 #include <filesystem>
 #include <string>
-#include <unordered_set>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -41,8 +39,13 @@ static std::atomic<bool>       g_suppressDimensionTick{false};
 static std::vector<Dimension*> g_collectedDimensions;
 static std::mutex              g_collectMutex;
 
-static std::unordered_set<std::string> g_dangerousFunctions;
-static std::mutex                      g_dangerousMutex;
+struct DangerousFunctionState {
+    uint64_t markedAtTick = 0;
+    uint64_t hitCount     = 0;
+};
+
+static std::unordered_map<std::string, DangerousFunctionState> g_dangerousFunctions;
+static std::mutex                                              g_dangerousMutex;
 
 MainThreadTaskQueue ParallelDimensionTickManager::mMainThreadTasks;
 
@@ -68,6 +71,99 @@ public:
 private:
     std::atomic<bool>& mFlag;
 };
+
+template <typename Func>
+inline void handleDangerousFunction(const char* funcName, Func&& func) {
+    if (!config.enabled) {
+        std::forward<Func>(func)();
+        return;
+    }
+
+    if (ParallelDimensionTickManager::isWorkerThread()
+        && ParallelDimensionTickManager::isFunctionDangerous(funcName)) {
+        ParallelDimensionTickManager::runOnMainThread(
+            [forwarded = std::forward<Func>(func)]() mutable { forwarded(); }
+        );
+        return;
+    }
+
+    std::forward<Func>(func)();
+}
+
+template <typename Func>
+inline void handleMobFunction(Mob* mob, const char* funcName, Func&& func) {
+    if (!config.enabled) {
+        std::forward<Func>(func)();
+        return;
+    }
+
+    if (!ParallelDimensionTickManager::isWorkerThread()) {
+        std::forward<Func>(func)();
+        return;
+    }
+
+    if (mob != nullptr && mob->isPlayer()) {
+        ParallelDimensionTickManager::runOnMainThread(
+            [forwarded = std::forward<Func>(func)]() mutable { forwarded(); }
+        );
+        return;
+    }
+
+    if (ParallelDimensionTickManager::isFunctionDangerous(funcName)) {
+        ParallelDimensionTickManager::runOnMainThread(
+            [forwarded = std::forward<Func>(func)]() mutable { forwarded(); }
+        );
+        return;
+    }
+
+    std::forward<Func>(func)();
+}
+
+template <typename Func>
+inline void handleActorFunction(Actor* actor, const char* funcName, Func&& func) {
+    if (!config.enabled) {
+        std::forward<Func>(func)();
+        return;
+    }
+
+    if (!ParallelDimensionTickManager::isWorkerThread()) {
+        std::forward<Func>(func)();
+        return;
+    }
+
+    if (actor != nullptr && actor->isPlayer()) {
+        ParallelDimensionTickManager::runOnMainThread(
+            [forwarded = std::forward<Func>(func)]() mutable { forwarded(); }
+        );
+        return;
+    }
+
+    if (ParallelDimensionTickManager::isFunctionDangerous(funcName)) {
+        ParallelDimensionTickManager::runOnMainThread(
+            [forwarded = std::forward<Func>(func)]() mutable { forwarded(); }
+        );
+        return;
+    }
+
+    std::forward<Func>(func)();
+}
+
+template <typename Func>
+inline void handlePlayerFunction(const char* funcName, Func&& func) {
+    if (!config.enabled) {
+        std::forward<Func>(func)();
+        return;
+    }
+
+    if (ParallelDimensionTickManager::isWorkerThread()) {
+        ParallelDimensionTickManager::runOnMainThread(
+            [forwarded = std::forward<Func>(func)]() mutable { forwarded(); }
+        );
+        return;
+    }
+
+    std::forward<Func>(func)();
+}
 
 } // namespace
 
@@ -149,7 +245,7 @@ size_t MainThreadTaskQueue::size() const {
 }
 
 //=============================================================================
-// ParallelDimensionTickManager implementation
+// ParallelDimensionTickManager
 //=============================================================================
 
 ParallelDimensionTickManager& ParallelDimensionTickManager::getInstance() {
@@ -170,9 +266,13 @@ void ParallelDimensionTickManager::initialize() {
     mFallbackStartTick = 0;
     mStopping.store(false, std::memory_order_release);
     mActiveDispatches.store(0, std::memory_order_release);
+    mCurrentTick.store(0, std::memory_order_release);
     mInitialized = true;
 
-    logger().info("Initialized per-dimension thread model, recovery interval = {} ticks", RECOVERY_INTERVAL_TICKS);
+    logger().info(
+        "Initialized per-dimension thread model, recovery interval = {} ticks",
+        RECOVERY_INTERVAL_TICKS
+    );
 }
 
 void ParallelDimensionTickManager::shutdown() {
@@ -250,16 +350,83 @@ void ParallelDimensionTickManager::runOnMainThread(std::function<void()> task) {
 }
 
 void ParallelDimensionTickManager::markFunctionDangerous(const std::string& funcName) {
+    auto&    manager     = getInstance();
+    uint64_t currentTick = manager.mCurrentTick.load(std::memory_order_acquire);
+
     std::lock_guard lock(g_dangerousMutex);
-    if (g_dangerousFunctions.insert(funcName).second) {
-        logger().warn("Function '{}' marked as dangerous (will run on main thread from now on)", funcName);
-        getInstance().mStats.totalDangerousFunctions.fetch_add(1, std::memory_order_relaxed);
+    auto& state = g_dangerousFunctions[funcName];
+    bool  first = (state.hitCount == 0);
+
+    state.markedAtTick = currentTick;
+    ++state.hitCount;
+
+    if (first) {
+        logger().warn(
+            "Function '{}' marked as dangerous at tick {} (will temporarily run on main thread)",
+            funcName,
+            currentTick
+        );
+        manager.mStats.totalDangerousFunctions.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        logger().warn(
+            "Function '{}' re-marked as dangerous at tick {} (hitCount={})",
+            funcName,
+            currentTick,
+            state.hitCount
+        );
     }
 }
 
 bool ParallelDimensionTickManager::isFunctionDangerous(const std::string& funcName) {
+    auto&    manager     = getInstance();
+    uint64_t currentTick = manager.mCurrentTick.load(std::memory_order_acquire);
+
     std::lock_guard lock(g_dangerousMutex);
-    return g_dangerousFunctions.find(funcName) != g_dangerousFunctions.end();
+    auto it = g_dangerousFunctions.find(funcName);
+    if (it == g_dangerousFunctions.end()) {
+        return false;
+    }
+
+    if (currentTick > 0
+        && currentTick - it->second.markedAtTick >= DANGEROUS_FUNCTION_RECOVERY_TICKS) {
+        logger().info(
+            "Dangerous function '{}' recovered at tick {}",
+            funcName,
+            currentTick
+        );
+        g_dangerousFunctions.erase(it);
+        manager.mStats.totalDangerousRecoveries.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+
+    return true;
+}
+
+void ParallelDimensionTickManager::recoverDangerousFunctions(uint64_t currentTick) {
+    std::vector<std::string> recovered;
+
+    {
+        std::lock_guard lock(g_dangerousMutex);
+        for (auto it = g_dangerousFunctions.begin(); it != g_dangerousFunctions.end();) {
+            if (currentTick - it->second.markedAtTick >= DANGEROUS_FUNCTION_RECOVERY_TICKS) {
+                recovered.push_back(it->first);
+                it = g_dangerousFunctions.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    for (auto const& name : recovered) {
+        logger().info("Dangerous function '{}' recovered at tick {}", name, currentTick);
+    }
+
+    if (!recovered.empty()) {
+        mStats.totalDangerousRecoveries.fetch_add(
+            static_cast<uint64_t>(recovered.size()),
+            std::memory_order_relaxed
+        );
+    }
 }
 
 void ParallelDimensionTickManager::workerLoop(DimensionWorkerContext* ctx) {
@@ -305,6 +472,9 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level, std::vector<Dim
 
     mSnapshot.time      = level->getTime();
     mSnapshot.simPaused = level->getSimPaused();
+    mCurrentTick.store(static_cast<uint64_t>(mSnapshot.time), std::memory_order_release);
+
+    recoverDangerousFunctions(static_cast<uint64_t>(mSnapshot.time));
 
     if (mSnapshot.simPaused) {
         return;
@@ -444,16 +614,14 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level, std::vector<Dim
 
     if (config.debug && (mStats.totalParallelTicks.load(std::memory_order_relaxed) % 200 == 0)) {
         logger().info(
-            "Parallel tick #{}: dims={} mainTasks={} fallbacks={} dangerous={} recoveryAttempts={} beParallel={} beSerial={} beMain={}",
+            "Parallel tick #{}: dims={}  mainTasks={}  fallbacks={}  dangerous={}  dangerousRecovered={}  recoveryAttempts={}",
             mStats.totalParallelTicks.load(std::memory_order_relaxed),
             activeContexts.size(),
             mStats.totalMainThreadTasks.load(std::memory_order_relaxed),
             mStats.totalFallbackTicks.load(std::memory_order_relaxed),
             mStats.totalDangerousFunctions.load(std::memory_order_relaxed),
-            mStats.totalRecoveryAttempts.load(std::memory_order_relaxed),
-            mStats.totalParallelBlockEntityTicks.load(std::memory_order_relaxed),
-            mStats.totalSerialBlockEntityTicks.load(std::memory_order_relaxed),
-            mStats.totalMainThreadBlockEntityTicks.load(std::memory_order_relaxed)
+            mStats.totalDangerousRecoveries.load(std::memory_order_relaxed),
+            mStats.totalRecoveryAttempts.load(std::memory_order_relaxed)
         );
 
         std::lock_guard contextsLock(mContextsMutex);
@@ -486,20 +654,20 @@ void ParallelDimensionTickManager::tickDimensionOnWorker(DimensionWorkerContext&
         exceptionOccurred = true;
         logger().error("std::exception in dim {} during [{}]: {}", tl_currentDimTypeId, tl_currentPhase, e.what());
 
-        if (tl_currentPhase != nullptr && tl_currentPhase[0] != '\0' &&
-            std::strcmp(tl_currentPhase, "pre-tick") != 0 &&
-            std::strcmp(tl_currentPhase, "post-tick") != 0 &&
-            std::strcmp(tl_currentPhase, "tick") != 0) {
+        if (tl_currentPhase != nullptr && tl_currentPhase[0] != '\0'
+            && std::strcmp(tl_currentPhase, "pre-tick") != 0
+            && std::strcmp(tl_currentPhase, "post-tick") != 0
+            && std::strcmp(tl_currentPhase, "tick") != 0) {
             markFunctionDangerous(tl_currentPhase);
         }
     } catch (...) {
         exceptionOccurred = true;
         logger().error("Unknown exception in dim {} during [{}]", tl_currentDimTypeId, tl_currentPhase);
 
-        if (tl_currentPhase != nullptr && tl_currentPhase[0] != '\0' &&
-            std::strcmp(tl_currentPhase, "pre-tick") != 0 &&
-            std::strcmp(tl_currentPhase, "post-tick") != 0 &&
-            std::strcmp(tl_currentPhase, "tick") != 0) {
+        if (tl_currentPhase != nullptr && tl_currentPhase[0] != '\0'
+            && std::strcmp(tl_currentPhase, "pre-tick") != 0
+            && std::strcmp(tl_currentPhase, "post-tick") != 0
+            && std::strcmp(tl_currentPhase, "tick") != 0) {
             markFunctionDangerous(tl_currentPhase);
         }
     }
@@ -544,67 +712,8 @@ void ParallelDimensionTickManager::serialFallbackTick(const std::vector<Dimensio
 }
 
 //=============================================================================
-// Helper template for dangerous function forwarding
+// Hooks: Dimension
 //=============================================================================
-
-template <typename Func>
-inline void handleDangerousFunction(const char* funcName, Func&& func) {
-    if (!config.enabled) {
-        std::forward<Func>(func)();
-        return;
-    }
-
-    if (ParallelDimensionTickManager::isWorkerThread() &&
-        ParallelDimensionTickManager::isFunctionDangerous(funcName)) {
-        ParallelDimensionTickManager::runOnMainThread(
-            [forwarded = std::forward<Func>(func)]() mutable { forwarded(); }
-        );
-        return;
-    }
-
-    std::forward<Func>(func)();
-}
-
-//=============================================================================
-// Hooks
-//=============================================================================
-
-LL_TYPE_INSTANCE_HOOK(
-    LevelChunkTickBlockEntitiesHook,
-    ll::memory::HookPriority::Normal,
-    LevelChunk,
-    &LevelChunk::$tickBlockEntities,
-    void,
-    BlockSource& tickRegion
-) {
-    const char* funcName = "tickBlockEntities";
-    ScopedPhase phase(funcName);
-
-    auto& manager = ParallelDimensionTickManager::getInstance();
-    auto& stats   = manager.getStats();
-
-    const bool inParallelDimWorker =
-        config.enabled &&
-        !manager.isStopping() &&
-        g_inParallelPhase.load(std::memory_order_acquire) &&
-        ParallelDimensionTickManager::isWorkerThread();
-
-    if (!inParallelDimWorker) {
-        stats.totalSerialBlockEntityTicks.fetch_add(1, std::memory_order_relaxed);
-        origin(tickRegion);
-        return;
-    }
-
-    if (ParallelDimensionTickManager::isFunctionDangerous(funcName)) {
-        stats.totalMainThreadBlockEntityTicks.fetch_add(1, std::memory_order_relaxed);
-    } else {
-        stats.totalParallelBlockEntityTicks.fetch_add(1, std::memory_order_relaxed);
-    }
-
-    handleDangerousFunction(funcName, [this, &tickRegion]() {
-        origin(tickRegion);
-    });
-}
 
 LL_TYPE_INSTANCE_HOOK(
     DimensionTickRedstoneHook,
@@ -613,7 +722,7 @@ LL_TYPE_INSTANCE_HOOK(
     &Dimension::$tickRedstone,
     void
 ) {
-    const char* funcName = "tickRedstone";
+    const char* funcName = "Dimension::tickRedstone";
     ScopedPhase phase(funcName);
     handleDangerousFunction(funcName, [this]() { origin(); });
 }
@@ -625,7 +734,7 @@ LL_TYPE_INSTANCE_HOOK(
     &Dimension::_sendBlocksChangedPackets,
     void
 ) {
-    const char* funcName = "_sendBlocksChangedPackets";
+    const char* funcName = "Dimension::_sendBlocksChangedPackets";
     ScopedPhase phase(funcName);
     handleDangerousFunction(funcName, [this]() { origin(); });
 }
@@ -637,7 +746,7 @@ LL_TYPE_INSTANCE_HOOK(
     &Dimension::_processEntityChunkTransfers,
     void
 ) {
-    const char* funcName = "_processEntityChunkTransfers";
+    const char* funcName = "Dimension::_processEntityChunkTransfers";
     ScopedPhase phase(funcName);
     handleDangerousFunction(funcName, [this]() { origin(); });
 }
@@ -649,7 +758,7 @@ LL_TYPE_INSTANCE_HOOK(
     &Dimension::_tickEntityChunkMoves,
     void
 ) {
-    const char* funcName = "_tickEntityChunkMoves";
+    const char* funcName = "Dimension::_tickEntityChunkMoves";
     ScopedPhase phase(funcName);
     handleDangerousFunction(funcName, [this]() { origin(); });
 }
@@ -661,7 +770,7 @@ LL_TYPE_INSTANCE_HOOK(
     &Dimension::_runChunkGenerationWatchdog,
     void
 ) {
-    const char* funcName = "_runChunkGenerationWatchdog";
+    const char* funcName = "Dimension::_runChunkGenerationWatchdog";
     ScopedPhase phase(funcName);
     handleDangerousFunction(funcName, [this]() { origin(); });
 }
@@ -675,7 +784,7 @@ LL_TYPE_INSTANCE_HOOK(
     Packet const& packet,
     Player*       except
 ) {
-    const char* funcName = "sendBroadcast";
+    const char* funcName = "Dimension::sendBroadcast";
     ScopedPhase phase(funcName);
     auto* packetPtr = &packet;
 
@@ -694,7 +803,7 @@ LL_TYPE_INSTANCE_HOOK(
     Packet const&   packet,
     Player const*   except
 ) {
-    const char* funcName = "sendPacketForPosition";
+    const char* funcName = "Dimension::sendPacketForPosition";
     ScopedPhase phase(funcName);
     auto* positionPtr = &position;
     auto* packetPtr   = &packet;
@@ -714,7 +823,7 @@ LL_TYPE_INSTANCE_HOOK(
     Packet const& packet,
     Player const* except
 ) {
-    const char* funcName = "sendPacketForEntity";
+    const char* funcName = "Dimension::sendPacketForEntity";
     ScopedPhase phase(funcName);
     auto* actorPtr  = &actor;
     auto* packetPtr = &packet;
@@ -780,7 +889,123 @@ LL_TYPE_INSTANCE_HOOK(
 }
 
 //=============================================================================
-// Plugin Implementation
+// Hooks: Mob / Actor / Player
+//=============================================================================
+
+LL_TYPE_INSTANCE_HOOK(
+    MobNormalTickHook,
+    ll::memory::HookPriority::Normal,
+    Mob,
+    &Mob::$normalTick,
+    void
+) {
+    const char* funcName = "Mob::normalTick";
+    ScopedPhase phase(funcName);
+    handleMobFunction(this, funcName, [this]() { origin(); });
+}
+
+LL_TYPE_INSTANCE_HOOK(
+    MobBaseTickHook,
+    ll::memory::HookPriority::Normal,
+    Mob,
+    &Mob::$baseTick,
+    void
+) {
+    const char* funcName = "Mob::baseTick";
+    ScopedPhase phase(funcName);
+    handleMobFunction(this, funcName, [this]() { origin(); });
+}
+
+LL_TYPE_INSTANCE_HOOK(
+    MobAiStepHook,
+    ll::memory::HookPriority::Normal,
+    Mob,
+    &Mob::$aiStep,
+    void
+) {
+    const char* funcName = "Mob::aiStep";
+    ScopedPhase phase(funcName);
+    handleMobFunction(this, funcName, [this]() { origin(); });
+}
+
+LL_TYPE_INSTANCE_HOOK(
+    MobNewServerAiStepHook,
+    ll::memory::HookPriority::Normal,
+    Mob,
+    &Mob::$newServerAiStep,
+    void
+) {
+    const char* funcName = "Mob::newServerAiStep";
+    ScopedPhase phase(funcName);
+    handleMobFunction(this, funcName, [this]() { origin(); });
+}
+
+LL_TYPE_INSTANCE_HOOK(
+    ActorPassengerTickHook,
+    ll::memory::HookPriority::Normal,
+    Actor,
+    &Actor::$passengerTick,
+    void
+) {
+    const char* funcName = "Actor::passengerTick";
+    ScopedPhase phase(funcName);
+    handleActorFunction(this, funcName, [this]() { origin(); });
+}
+
+// Player 固定主线程，避免把玩家相关网络/维度/输入逻辑放到 worker 上
+LL_TYPE_INSTANCE_HOOK(
+    PlayerNormalTickHook,
+    ll::memory::HookPriority::Normal,
+    Player,
+    &Player::$normalTick,
+    void
+) {
+    const char* funcName = "Player::normalTick";
+    ScopedPhase phase(funcName);
+    handlePlayerFunction(funcName, [this]() { origin(); });
+}
+
+LL_TYPE_INSTANCE_HOOK(
+    PlayerAiStepHook,
+    ll::memory::HookPriority::Normal,
+    Player,
+    &Player::$aiStep,
+    void
+) {
+    const char* funcName = "Player::aiStep";
+    ScopedPhase phase(funcName);
+    handlePlayerFunction(funcName, [this]() { origin(); });
+}
+
+LL_TYPE_INSTANCE_HOOK(
+    PlayerPassengerTickHook,
+    ll::memory::HookPriority::Normal,
+    Player,
+    &Player::$passengerTick,
+    void
+) {
+    const char* funcName = "Player::passengerTick";
+    ScopedPhase phase(funcName);
+    handlePlayerFunction(funcName, [this]() { origin(); });
+}
+
+LL_TYPE_INSTANCE_HOOK(
+    PlayerTickWorldHook,
+    ll::memory::HookPriority::Normal,
+    Player,
+    &Player::$tickWorld,
+    void,
+    Tick const& tick
+) {
+    const char* funcName = "Player::tickWorld";
+    ScopedPhase phase(funcName);
+    auto* tickPtr = &tick;
+
+    handlePlayerFunction(funcName, [this, tickPtr]() { origin(*tickPtr); });
+}
+
+//=============================================================================
+// Plugin
 //=============================================================================
 
 PluginImpl& PluginImpl::getInstance() {
@@ -804,7 +1029,7 @@ bool PluginImpl::enable() {
     if (!hookInstalled) {
         LevelTickHook::hook();
         DimensionTickHook::hook();
-        LevelChunkTickBlockEntitiesHook::hook();
+
         DimensionTickRedstoneHook::hook();
         DimensionSendBlocksChangedHook::hook();
         DimensionProcessEntityTransfersHook::hook();
@@ -813,6 +1038,18 @@ bool PluginImpl::enable() {
         DimensionSendBroadcastHook::hook();
         DimensionSendPacketForPositionHook::hook();
         DimensionSendPacketForEntityHook::hook();
+
+        MobNormalTickHook::hook();
+        MobBaseTickHook::hook();
+        MobAiStepHook::hook();
+        MobNewServerAiStepHook::hook();
+        ActorPassengerTickHook::hook();
+
+        PlayerNormalTickHook::hook();
+        PlayerAiStepHook::hook();
+        PlayerPassengerTickHook::hook();
+        PlayerTickWorldHook::hook();
+
         hookInstalled = true;
     }
 
@@ -828,7 +1065,7 @@ bool PluginImpl::disable() {
     if (hookInstalled) {
         LevelTickHook::unhook();
         DimensionTickHook::unhook();
-        LevelChunkTickBlockEntitiesHook::unhook();
+
         DimensionTickRedstoneHook::unhook();
         DimensionSendBlocksChangedHook::unhook();
         DimensionProcessEntityTransfersHook::unhook();
@@ -837,6 +1074,18 @@ bool PluginImpl::disable() {
         DimensionSendBroadcastHook::unhook();
         DimensionSendPacketForPositionHook::unhook();
         DimensionSendPacketForEntityHook::unhook();
+
+        MobNormalTickHook::unhook();
+        MobBaseTickHook::unhook();
+        MobAiStepHook::unhook();
+        MobNewServerAiStepHook::unhook();
+        ActorPassengerTickHook::unhook();
+
+        PlayerNormalTickHook::unhook();
+        PlayerAiStepHook::unhook();
+        PlayerPassengerTickHook::unhook();
+        PlayerTickWorldHook::unhook();
+
         hookInstalled = false;
     }
 
