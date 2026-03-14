@@ -196,7 +196,9 @@ bool ParallelDimensionTickManager::isWorkerThread() { return tl_isWorkerThread; 
 
 DimensionWorkerContext* ParallelDimensionTickManager::getCurrentContext() { return tl_currentContext; }
 
-DimensionType ParallelDimensionTickManager::getCurrentDimensionType() { return DimensionType(tl_currentDimTypeId); }
+DimensionType ParallelDimensionTickManager::getCurrentDimensionType() {
+    return static_cast<DimensionType>(tl_currentDimTypeId);
+}
 
 void ParallelDimensionTickManager::notifyDispatchProgress() {
     mDispatchCV.notify_one();
@@ -303,7 +305,7 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level, std::vector<Dim
     }
 
     for (auto* dim : dimensions) {
-        const int dimId = dim->getDimensionId();
+        const int dimId = static_cast<int>(dim->getDimensionId());
         auto      it    = mContexts.find(dimId);
 
         if (it == mContexts.end()) {
@@ -315,13 +317,16 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level, std::vector<Dim
     }
 
     for (auto* dim : dimensions) {
-        auto& ctx = mContexts[dim->getDimensionId()];
+        const int dimId = static_cast<int>(dim->getDimensionId());
+        auto&     ctx   = mContexts[dimId];
+
         {
             std::lock_guard lock(ctx->wakeMutex);
             ctx->dimension = dim;
             ctx->tickCompleted.store(false, std::memory_order_release);
             ctx->shouldWork = true;
         }
+
         ctx->wakeCV.notify_one();
     }
 
@@ -331,7 +336,9 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level, std::vector<Dim
         processAllMainThreadTasks();
 
         for (auto* dim : dimensions) {
-            auto& ctx = mContexts[dim->getDimensionId()];
+            const int dimId = static_cast<int>(dim->getDimensionId());
+            auto&     ctx   = mContexts[dimId];
+
             if (ctx->tickCompleted.exchange(false, std::memory_order_acq_rel)) {
                 if (remaining > 0) {
                     --remaining;
@@ -373,10 +380,12 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level, std::vector<Dim
 }
 
 void ParallelDimensionTickManager::tickDimensionOnWorker(DimensionWorkerContext& ctx) {
-    tl_isWorkerThread   = true;
-    tl_currentContext   = &ctx;
-    tl_currentDimTypeId = (ctx.dimension != nullptr) ? ctx.dimension->getDimensionId() : -1;
-    tl_currentPhase     = "pre-tick";
+    tl_isWorkerThread = true;
+    tl_currentContext = &ctx;
+    tl_currentDimTypeId = (ctx.dimension != nullptr)
+        ? static_cast<int>(ctx.dimension->getDimensionId())
+        : -1;
+    tl_currentPhase = "pre-tick";
 
     auto start = std::chrono::steady_clock::now();
     bool exceptionOccurred = false;
@@ -541,9 +550,9 @@ LL_TYPE_INSTANCE_HOOK(
     Packet const& packet,
     Player*       except
 ) {
-    const char*  funcName  = "sendBroadcast";
-    ScopedPhase  phase(funcName);
-    auto*        packetPtr = &packet;
+    const char* funcName = "sendBroadcast";
+    ScopedPhase phase(funcName);
+    auto* packetPtr = &packet;
 
     handleDangerousFunction(funcName, [this, packetPtr, except]() {
         origin(*packetPtr, except);
@@ -560,10 +569,10 @@ LL_TYPE_INSTANCE_HOOK(
     Packet const&   packet,
     Player const*   except
 ) {
-    const char* funcName    = "sendPacketForPosition";
+    const char* funcName = "sendPacketForPosition";
     ScopedPhase phase(funcName);
-    auto*       positionPtr = &position;
-    auto*       packetPtr   = &packet;
+    auto* positionPtr = &position;
+    auto* packetPtr   = &packet;
 
     handleDangerousFunction(funcName, [this, positionPtr, packetPtr, except]() {
         origin(*positionPtr, *packetPtr, except);
@@ -580,10 +589,10 @@ LL_TYPE_INSTANCE_HOOK(
     Packet const& packet,
     Player const* except
 ) {
-    const char* funcName  = "sendPacketForEntity";
+    const char* funcName = "sendPacketForEntity";
     ScopedPhase phase(funcName);
-    auto*       actorPtr  = &actor;
-    auto*       packetPtr = &packet;
+    auto* actorPtr  = &actor;
+    auto* packetPtr = &packet;
 
     handleDangerousFunction(funcName, [this, actorPtr, packetPtr, except]() {
         origin(*actorPtr, *packetPtr, except);
