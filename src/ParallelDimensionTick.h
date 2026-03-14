@@ -1,21 +1,23 @@
-#pragma once 
+#pragma once
 
 #include <ll/api/Config.h>
 #include <ll/api/io/Logger.h>
 #include <ll/api/mod/NativeMod.h>
 
+#include <mc/network/Packet.h>
 #include <mc/world/level/BlockPos.h>
 #include <mc/world/level/dimension/Dimension.h>
-#include <mc/network/Packet.h>
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 namespace dim_parallel {
@@ -33,14 +35,27 @@ ll::io::Logger& logger();
 
 class MainThreadTaskQueue {
 public:
-    void   enqueue(std::function<void()> task);
-    void   processAll();
-    size_t size() const;
+    struct SyncState {
+        std::mutex              mutex;
+        std::condition_variable cv;
+        bool                    done = false;
+        std::exception_ptr      exception;
+    };
+
+    void                            enqueue(std::function<void()> task);
+    std::shared_ptr<SyncState>      enqueueSync(std::function<void()> task);
+    size_t                          processAll();
+    size_t                          size() const;
 
 private:
-    mutable std::mutex                 mMutex;
-    std::vector<std::function<void()>> mTasks;
-    std::vector<std::function<void()>> mProcessing;
+    struct TaskItem {
+        std::function<void()>   fn;
+        std::shared_ptr<SyncState> sync;
+    };
+
+    mutable std::mutex      mMutex;
+    std::vector<TaskItem>   mTasks;
+    std::vector<TaskItem>   mProcessing;
 };
 
 struct LevelTickSnapshot {
@@ -49,15 +64,15 @@ struct LevelTickSnapshot {
 };
 
 struct DimensionWorkerContext {
-    Dimension* dimension = nullptr;
-    uint64_t   lastTickTimeUs = 0;
+    Dimension*               dimension      = nullptr;
+    uint64_t                 lastTickTimeUs = 0;
 
-    std::thread                 workerThread;
-    std::mutex                  wakeMutex;
-    std::condition_variable     wakeCV;
-    bool                        shouldWork = false;
-    bool                        shutdown   = false;
-    std::atomic<bool>           tickCompleted{false};
+    std::thread              workerThread;
+    std::mutex               wakeMutex;
+    std::condition_variable  wakeCV;
+    bool                     shouldWork = false;
+    bool                     shutdown   = false;
+    std::atomic<bool>        tickCompleted{false};
 };
 
 class ParallelDimensionTickManager {
@@ -66,7 +81,7 @@ public:
 
     void initialize();
     void shutdown();
-    void dispatchAndSync(class Level* level);
+    void dispatchAndSync(class Level* level, std::vector<Dimension*> dimensions);
 
     static bool                    isWorkerThread();
     static DimensionWorkerContext* getCurrentContext();
@@ -84,26 +99,31 @@ public:
         std::atomic<uint64_t> totalRecoveryAttempts{0};
         std::atomic<uint64_t> totalDangerousFunctions{0};
     };
+
     Stats& getStats() { return mStats; }
 
 private:
     ParallelDimensionTickManager() = default;
 
-    void tickDimensionOnWorker(DimensionWorkerContext& ctx);
-    void processAllMainThreadTasks();
-    void serialFallbackTick(std::vector<Dimension*>& dimensions);
-    void workerLoop(DimensionWorkerContext* ctx);
+    void     tickDimensionOnWorker(DimensionWorkerContext& ctx);
+    size_t   processAllMainThreadTasks();
+    void     serialFallbackTick(const std::vector<Dimension*>& dimensions);
+    void     workerLoop(DimensionWorkerContext* ctx);
+    void     notifyDispatchProgress();
 
     std::unordered_map<int, std::unique_ptr<DimensionWorkerContext>> mContexts;
-    LevelTickSnapshot                               mSnapshot;
-    std::atomic<bool>                               mFallbackToSerial{false};
-    bool                                             mInitialized = false;
-    Stats                                            mStats;
+    LevelTickSnapshot                                                mSnapshot;
+    std::atomic<bool>                                                mFallbackToSerial{false};
+    bool                                                             mInitialized = false;
+    Stats                                                            mStats;
 
-    static MainThreadTaskQueue                       mMainThreadTasks;
+    std::mutex               mDispatchMutex;
+    std::condition_variable  mDispatchCV;
 
-    static constexpr uint64_t                        RECOVERY_INTERVAL_TICKS = 20;
-    uint64_t                                          mFallbackStartTick = 0;
+    static MainThreadTaskQueue mMainThreadTasks;
+
+    static constexpr uint64_t RECOVERY_INTERVAL_TICKS = 20;
+    uint64_t                  mFallbackStartTick      = 0;
 };
 
 class PluginImpl {
@@ -111,6 +131,7 @@ public:
     static PluginImpl& getInstance();
     PluginImpl() : mSelf(*ll::mod::NativeMod::current()) {}
     [[nodiscard]] ll::mod::NativeMod& getSelf() const { return mSelf; }
+
     bool load();
     bool enable();
     bool disable();
