@@ -4,6 +4,8 @@
 #include <ll/api/io/Logger.h>
 #include <ll/api/mod/NativeMod.h>
 
+#include <mc/network/Packet.h>
+#include <mc/world/level/BlockPos.h>
 #include <mc/world/level/dimension/Dimension.h>
 
 #include <atomic>
@@ -51,9 +53,9 @@ private:
         std::shared_ptr<SyncState> sync;
     };
 
-    mutable std::mutex     mMutex;
-    std::vector<TaskItem>  mTasks;
-    std::vector<TaskItem>  mProcessing;
+    mutable std::mutex   mMutex;
+    std::vector<TaskItem> mTasks;
+    std::vector<TaskItem> mProcessing;
 };
 
 struct LevelTickSnapshot {
@@ -98,7 +100,6 @@ public:
         std::atomic<uint64_t> maxDimTickTimeUs{0};
         std::atomic<uint64_t> totalRecoveryAttempts{0};
         std::atomic<uint64_t> totalDangerousFunctions{0};
-        std::atomic<uint64_t> totalDangerousRecoveries{0};
     };
 
     Stats& getStats() { return mStats; }
@@ -106,21 +107,21 @@ public:
 private:
     ParallelDimensionTickManager() = default;
 
-    void   tickDimensionOnWorker(DimensionWorkerContext& ctx);
-    size_t processAllMainThreadTasks();
-    void   serialFallbackTick(const std::vector<Dimension*>& dimensions);
-    void   workerLoop(DimensionWorkerContext* ctx);
-    void   notifyDispatchProgress();
-    void   recoverDangerousFunctions(uint64_t currentTick);
+    void     tickDimensionOnWorker(DimensionWorkerContext& ctx);
+    size_t   processAllMainThreadTasks();
+    void     serialFallbackTick(const std::vector<Dimension*>& dimensions);
+    void     workerLoop(DimensionWorkerContext* ctx);
+    void     notifyDispatchProgress();
+    uint64_t getCurrentTick() const;
 
     std::unordered_map<int, std::unique_ptr<DimensionWorkerContext>> mContexts;
     std::mutex                                                       mContextsMutex;
 
     LevelTickSnapshot                                                mSnapshot;
+    std::atomic<uint64_t>                                            mCurrentTick{0};
     std::atomic<bool>                                                mFallbackToSerial{false};
     std::atomic<bool>                                                mStopping{false};
     std::atomic<uint32_t>                                            mActiveDispatches{0};
-    std::atomic<uint64_t>                                            mCurrentTick{0};
     bool                                                             mInitialized = false;
     Stats                                                            mStats;
 
@@ -129,9 +130,8 @@ private:
 
     static MainThreadTaskQueue mMainThreadTasks;
 
-    static constexpr uint64_t RECOVERY_INTERVAL_TICKS            = 20;
-    static constexpr uint64_t DANGEROUS_FUNCTION_RECOVERY_TICKS  = 20;
-    uint64_t                  mFallbackStartTick                 = 0;
+    static constexpr uint64_t RECOVERY_INTERVAL_TICKS = 20;
+    uint64_t                  mFallbackStartTick      = 0;
 };
 
 class PluginImpl {
