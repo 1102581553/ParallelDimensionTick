@@ -43,9 +43,9 @@ public:
     };
 
     struct ProcessStats {
-        size_t   total    = 0;
-        size_t   sync     = 0;
-        size_t   async    = 0;
+        size_t   total     = 0;
+        size_t   sync      = 0;
+        size_t   async     = 0;
         uint64_t elapsedUs = 0;
     };
 
@@ -101,38 +101,80 @@ public:
     static bool isFunctionDangerous(const std::string& funcName);
 
     struct Stats {
+        std::atomic<uint64_t> totalLevelTicks{0};
         std::atomic<uint64_t> totalParallelTicks{0};
         std::atomic<uint64_t> totalFallbackTicks{0};
-        std::atomic<uint64_t> totalMainThreadTasks{0};
-        std::atomic<uint64_t> maxDimTickTimeUs{0};
-        std::atomic<uint64_t> totalRecoveryAttempts{0};
-        std::atomic<uint64_t> totalDangerousFunctions{0};
 
-        // 新增：主线程任务细分
+        std::atomic<uint64_t> totalMainThreadTasks{0};
         std::atomic<uint64_t> totalMainThreadSyncTasks{0};
         std::atomic<uint64_t> totalMainThreadAsyncTasks{0};
 
-        // 新增：整次 dispatch 耗时
+        std::atomic<uint64_t> totalRecoveryAttempts{0};
+        std::atomic<uint64_t> totalDangerousFunctions{0};
+
+        std::atomic<uint64_t> totalLevelOriginTimeUs{0};
+        std::atomic<uint64_t> maxLevelOriginTimeUs{0};
+
+        std::atomic<uint64_t> totalLevelHookTimeUs{0};
+        std::atomic<uint64_t> maxLevelHookTimeUs{0};
+
         std::atomic<uint64_t> totalDispatchTimeUs{0};
         std::atomic<uint64_t> maxDispatchTimeUs{0};
 
-        // 新增：主线程任务处理耗时
-        std::atomic<uint64_t> totalMainThreadTaskProcessTimeUs{0};
-        std::atomic<uint64_t> maxMainThreadTaskProcessTimeUs{0};
-
-        // 新增：主线程等待 worker 的耗时
         std::atomic<uint64_t> totalDispatchWaitTimeUs{0};
         std::atomic<uint64_t> maxDispatchWaitTimeUs{0};
 
-        // 新增：所有维度 tick 耗时总和，用来观察并行收益
         std::atomic<uint64_t> totalAllDimTickTimeUs{0};
         std::atomic<uint64_t> maxAllDimTickTimeUs{0};
+        std::atomic<uint64_t> maxDimTickTimeUs{0};
+
+        std::atomic<uint64_t> totalFallbackTimeUs{0};
+        std::atomic<uint64_t> maxFallbackTimeUs{0};
+
+        std::atomic<uint64_t> totalMainThreadTaskProcessTimeUs{0};
+        std::atomic<uint64_t> maxMainThreadTaskProcessTimeUs{0};
     };
 
     Stats& getStats() { return mStats; }
 
+    void recordLevelTickStats(uint64_t levelOriginUs, uint64_t levelHookUs);
+
 private:
     ParallelDimensionTickManager() = default;
+
+    struct WindowStats {
+        uint64_t levelTicks = 0;
+        uint64_t parallelTicks = 0;
+        uint64_t fallbackTicks = 0;
+
+        uint64_t totalLevelOriginTimeUs = 0;
+        uint64_t maxLevelOriginTimeUs   = 0;
+
+        uint64_t totalLevelHookTimeUs = 0;
+        uint64_t maxLevelHookTimeUs   = 0;
+
+        uint64_t totalDispatchTimeUs = 0;
+        uint64_t maxDispatchTimeUs   = 0;
+
+        uint64_t totalDispatchWaitTimeUs = 0;
+        uint64_t maxDispatchWaitTimeUs   = 0;
+
+        uint64_t totalAllDimTickTimeUs = 0;
+        uint64_t maxAllDimTickTimeUs   = 0;
+
+        uint64_t totalFallbackTimeUs = 0;
+        uint64_t maxFallbackTimeUs   = 0;
+
+        uint64_t totalMainThreadTasks = 0;
+        uint64_t totalMainThreadSyncTasks = 0;
+        uint64_t totalMainThreadAsyncTasks = 0;
+
+        uint64_t totalMainThreadTaskProcessTimeUs = 0;
+        uint64_t maxMainThreadTaskProcessTimeUs   = 0;
+
+        uint64_t totalDispatchDims = 0;
+        uint64_t maxDispatchDims   = 0;
+    };
 
     void     tickDimensionOnWorker(DimensionWorkerContext& ctx);
     size_t   processAllMainThreadTasks();
@@ -140,6 +182,10 @@ private:
     void     workerLoop(DimensionWorkerContext* ctx);
     void     notifyDispatchProgress();
     uint64_t getCurrentTick() const;
+
+    void recordDispatchStats(uint64_t dispatchUs, uint64_t waitUs, uint64_t allDimUs, size_t dims);
+    void recordFallbackStats(uint64_t fallbackUs);
+    void maybeLogWindowStats();
 
     std::unordered_map<int, std::unique_ptr<DimensionWorkerContext>> mContexts;
     std::mutex                                                       mContextsMutex;
@@ -151,6 +197,7 @@ private:
     std::atomic<uint32_t>                                            mActiveDispatches{0};
     bool                                                             mInitialized = false;
     Stats                                                            mStats;
+    WindowStats                                                      mWindowStats;
 
     std::mutex              mDispatchMutex;
     std::condition_variable mDispatchCV;
@@ -158,7 +205,9 @@ private:
     static MainThreadTaskQueue mMainThreadTasks;
 
     static constexpr uint64_t RECOVERY_INTERVAL_TICKS = 20;
-    uint64_t                  mFallbackStartTick      = 0;
+    static constexpr uint64_t DEBUG_WINDOW_TICKS      = 200;
+
+    uint64_t mFallbackStartTick = 0;
 };
 
 class PluginImpl {
