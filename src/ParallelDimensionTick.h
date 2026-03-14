@@ -26,7 +26,7 @@ class Level;
 namespace dim_parallel {
 
 struct Config {
-    int  version            = 5;
+    int  version            = 6;
     bool enabled            = true;
     bool debug              = false;
     bool parallelNormalTick = true;
@@ -75,9 +75,20 @@ struct LevelTickSnapshot {
 };
 
 struct DimensionWorkerContext {
+    struct TaskResult {
+        std::mutex              mutex;
+        std::condition_variable cv;
+        bool                    done = false;
+        std::exception_ptr      exception;
+        bool                    dimensionMismatchBeforeRun = false;
+        uint64_t                execTimeUs = 0;
+    };
+
     struct TaskItem {
         std::function<void()>      fn;
-        std::shared_ptr<MainThreadTaskQueue::SyncState> sync;
+        std::shared_ptr<TaskResult> result;
+        Actor*                     actor                = nullptr;
+        int                        scheduledDimensionId = -1;
         std::string                debugName;
     };
 
@@ -200,8 +211,15 @@ private:
     void                    maybeLogWindowStats();
     void                    recordNormalTickStats(uint64_t execUs, uint64_t waitUs);
 
+    void     quarantineActor(Actor* actor, uint64_t untilTick);
+    bool     isActorQuarantined(Actor* actor, uint64_t nowTick) const;
+    void     cleanupActorQuarantine(uint64_t nowTick);
+
     std::unordered_map<int, std::unique_ptr<DimensionWorkerContext>> mContexts;
     std::mutex                                                       mContextsMutex;
+
+    mutable std::mutex                                               mActorQuarantineMutex;
+    std::unordered_map<Actor*, uint64_t>                             mActorMainThreadUntilTick;
 
     LevelTickSnapshot                                                mSnapshot;
     std::atomic<uint64_t>                                            mCurrentTick{0};
@@ -214,8 +232,9 @@ private:
 
     static MainThreadTaskQueue mMainThreadTasks;
 
-    static constexpr uint64_t RECOVERY_INTERVAL_TICKS = 20;
-    static constexpr uint64_t DEBUG_WINDOW_TICKS      = 200;
+    static constexpr uint64_t RECOVERY_INTERVAL_TICKS    = 20;
+    static constexpr uint64_t ACTOR_QUARANTINE_TICKS     = 40;
+    static constexpr uint64_t DEBUG_WINDOW_TICKS         = 200;
 };
 
 class PluginImpl {
