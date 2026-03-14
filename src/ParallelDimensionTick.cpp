@@ -28,9 +28,9 @@
 
 namespace dim_parallel {
 
-static Config                          config;
+static Config                           config;
 static std::shared_ptr<ll::io::Logger> log;
-static bool                            hookInstalled = false;
+static bool                             hookInstalled = false;
 
 static thread_local DimensionWorkerContext* tl_currentContext   = nullptr;
 static thread_local bool                    tl_isWorkerThread   = false;
@@ -49,6 +49,16 @@ static std::mutex                                g_dangerousMutex;
 MainThreadTaskQueue ParallelDimensionTickManager::mMainThreadTasks;
 
 namespace {
+
+template <typename T>
+inline void updateMax(std::atomic<T>& target, T value) {
+    T expected = target.load(std::memory_order_relaxed);
+    while (value > expected) {
+        if (target.compare_exchange_weak(expected, value, std::memory_order_relaxed)) {
+            break;
+        }
+    }
+}
 
 class ScopedPhase {
 public:
@@ -193,7 +203,6 @@ inline void handlePlayerFunction(const char* funcName, Func&& func) {
         return;
     }
 
-    // 已经在主线程就直接跑
     (void)funcName;
     std::forward<Func>(func)();
 }
@@ -254,15 +263,24 @@ std::shared_ptr<MainThreadTaskQueue::SyncState> MainThreadTaskQueue::enqueueSync
     return sync;
 }
 
-size_t MainThreadTaskQueue::processAll() {
+MainThreadTaskQueue::ProcessStats MainThreadTaskQueue::processAll() {
+    auto start = std::chrono::steady_clock::now();
+
     {
         std::lock_guard lock(mMutex);
         mProcessing.swap(mTasks);
     }
 
-    const size_t count = mProcessing.size();
+    ProcessStats stats{};
+    stats.total = mProcessing.size();
 
     for (auto& item : mProcessing) {
+        if (item.sync) {
+            ++stats.sync;
+        } else {
+            ++stats.async;
+        }
+
         std::exception_ptr taskException;
 
         try {
@@ -290,7 +308,12 @@ size_t MainThreadTaskQueue::processAll() {
     }
 
     mProcessing.clear();
-    return count;
+
+    auto end     = std::chrono::steady_clock::now();
+    stats.elapsedUs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(end - start).count()
+    );
+    return stats;
 }
 
 size_t MainThreadTaskQueue::size() const {
@@ -510,6 +533,8 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level, std::vector<Dim
         return;
     }
 
+    auto dispatchStart = std::chrono::steady_clock::now();
+
     mActiveDispatches.fetch_add(1, std::memory_order_acq_rel);
     bool dispatchRegistered = true;
 
@@ -608,7 +633,9 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level, std::vector<Dim
         ctx->wakeCV.notify_one();
     }
 
-    size_t remaining = activeContexts.size();
+    size_t   remaining        = activeContexts.size();
+    uint64_t dispatchWaitUs   = 0;
+    uint64_t allDimTickTimeUs = 0;
 
     while (remaining > 0) {
         processAllMainThreadTasks();
@@ -625,24 +652,113 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level, std::vector<Dim
             break;
         }
 
-        std::unique_lock dispatchLock(mDispatchMutex);
-        mDispatchCV.wait_for(dispatchLock, std::chrono::milliseconds(1));
+        auto waitStart = std::chrono::steady_clock::now();
+        {
+            std::unique_lock dispatchLock(mDispatchMutex);
+            mDispatchCV.wait_for(dispatchLock, std::chrono::milliseconds(1));
+        }
+        auto waitEnd = std::chrono::steady_clock::now();
+
+        dispatchWaitUs += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(waitEnd - waitStart).count()
+        );
     }
 
     processAllMainThreadTasks();
+
+    for (auto* ctx : activeContexts) {
+        if (ctx != nullptr) {
+            allDimTickTimeUs += ctx->lastTickTimeUs;
+        }
+    }
+
+    auto dispatchEnd = std::chrono::steady_clock::now();
+    uint64_t dispatchTimeUs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(dispatchEnd - dispatchStart).count()
+    );
+
+    mStats.totalDispatchTimeUs.fetch_add(dispatchTimeUs, std::memory_order_relaxed);
+    mStats.totalDispatchWaitTimeUs.fetch_add(dispatchWaitUs, std::memory_order_relaxed);
+    mStats.totalAllDimTickTimeUs.fetch_add(allDimTickTimeUs, std::memory_order_relaxed);
+
+    updateMax(mStats.maxDispatchTimeUs, dispatchTimeUs);
+    updateMax(mStats.maxDispatchWaitTimeUs, dispatchWaitUs);
+    updateMax(mStats.maxAllDimTickTimeUs, allDimTickTimeUs);
 
     if (!fallbackBeforeDispatch && mFallbackToSerial.load(std::memory_order_acquire)) {
         mFallbackStartTick = currentTick;
     }
 
-    mStats.totalParallelTicks.fetch_add(1, std::memory_order_relaxed);
+    const uint64_t totalParallelTicks =
+        mStats.totalParallelTicks.fetch_add(1, std::memory_order_relaxed) + 1;
 
-    if (config.debug && (mStats.totalParallelTicks.load(std::memory_order_relaxed) % 200 == 0)) {
+    if (config.debug && (totalParallelTicks % 200 == 0)) {
+        const uint64_t totalMainTasks =
+            mStats.totalMainThreadTasks.load(std::memory_order_relaxed);
+        const uint64_t totalSyncTasks =
+            mStats.totalMainThreadSyncTasks.load(std::memory_order_relaxed);
+        const uint64_t totalAsyncTasks =
+            mStats.totalMainThreadAsyncTasks.load(std::memory_order_relaxed);
+
+        const uint64_t totalDispatchUs =
+            mStats.totalDispatchTimeUs.load(std::memory_order_relaxed);
+        const uint64_t totalWaitUs =
+            mStats.totalDispatchWaitTimeUs.load(std::memory_order_relaxed);
+        const uint64_t totalTaskProcessUs =
+            mStats.totalMainThreadTaskProcessTimeUs.load(std::memory_order_relaxed);
+        const uint64_t totalAllDimUs =
+            mStats.totalAllDimTickTimeUs.load(std::memory_order_relaxed);
+
+        const uint64_t avgDispatchUs =
+            totalParallelTicks > 0 ? (totalDispatchUs / totalParallelTicks) : 0;
+        const uint64_t avgWaitUs =
+            totalParallelTicks > 0 ? (totalWaitUs / totalParallelTicks) : 0;
+        const uint64_t avgTaskProcessUs =
+            totalParallelTicks > 0 ? (totalTaskProcessUs / totalParallelTicks) : 0;
+        const uint64_t avgAllDimUs =
+            totalParallelTicks > 0 ? (totalAllDimUs / totalParallelTicks) : 0;
+
+        const double parallelGain =
+            dispatchTimeUs > 0 ? static_cast<double>(allDimTickTimeUs) / static_cast<double>(dispatchTimeUs) : 0.0;
+
+        const double avgParallelGain =
+            totalDispatchUs > 0 ? static_cast<double>(totalAllDimUs) / static_cast<double>(totalDispatchUs) : 0.0;
+
         logger().info(
-            "Parallel tick #{}: dims={}  mainTasks={}  fallbacks={}  dangerousHits={}  recoveryAttempts={}",
-            mStats.totalParallelTicks.load(std::memory_order_relaxed),
+            "Parallel tick #{}: dims={} dispatch={}us(avg={}us max={}us) wait={}us(avg={}us max={}us)",
+            totalParallelTicks,
             activeContexts.size(),
-            mStats.totalMainThreadTasks.load(std::memory_order_relaxed),
+            dispatchTimeUs,
+            avgDispatchUs,
+            mStats.maxDispatchTimeUs.load(std::memory_order_relaxed),
+            dispatchWaitUs,
+            avgWaitUs,
+            mStats.maxDispatchWaitTimeUs.load(std::memory_order_relaxed)
+        );
+
+        logger().info(
+            "  dimSum={}us(avg={}us max={}us) gain={:.2f}x(avg={:.2f}x) maxSingleDim={}us",
+            allDimTickTimeUs,
+            avgAllDimUs,
+            mStats.maxAllDimTickTimeUs.load(std::memory_order_relaxed),
+            parallelGain,
+            avgParallelGain,
+            mStats.maxDimTickTimeUs.load(std::memory_order_relaxed)
+        );
+
+        logger().info(
+            "  mainTasks={} (sync={} async={}) taskProcess={}us(avg={}us max={}us) queue={}",
+            totalMainTasks,
+            totalSyncTasks,
+            totalAsyncTasks,
+            mStats.totalMainThreadTaskProcessTimeUs.load(std::memory_order_relaxed),
+            avgTaskProcessUs,
+            mStats.maxMainThreadTaskProcessTimeUs.load(std::memory_order_relaxed),
+            mMainThreadTasks.size()
+        );
+
+        logger().info(
+            "  fallbacks={} dangerousHits={} recoveryAttempts={}",
             mStats.totalFallbackTicks.load(std::memory_order_relaxed),
             mStats.totalDangerousFunctions.load(std::memory_order_relaxed),
             mStats.totalRecoveryAttempts.load(std::memory_order_relaxed)
@@ -705,12 +821,7 @@ void ParallelDimensionTickManager::tickDimensionOnWorker(DimensionWorkerContext&
         std::chrono::duration_cast<std::chrono::microseconds>(end - start).count()
     );
 
-    uint64_t expected = mStats.maxDimTickTimeUs.load(std::memory_order_relaxed);
-    while (ctx.lastTickTimeUs > expected) {
-        if (mStats.maxDimTickTimeUs.compare_exchange_weak(expected, ctx.lastTickTimeUs, std::memory_order_relaxed)) {
-            break;
-        }
-    }
+    updateMax(mStats.maxDimTickTimeUs, ctx.lastTickTimeUs);
 
     tl_isWorkerThread   = false;
     tl_currentContext   = nullptr;
@@ -719,11 +830,15 @@ void ParallelDimensionTickManager::tickDimensionOnWorker(DimensionWorkerContext&
 }
 
 size_t ParallelDimensionTickManager::processAllMainThreadTasks() {
-    const size_t count = mMainThreadTasks.processAll();
-    if (count > 0) {
-        mStats.totalMainThreadTasks.fetch_add(static_cast<uint64_t>(count), std::memory_order_relaxed);
+    auto stats = mMainThreadTasks.processAll();
+    if (stats.total > 0) {
+        mStats.totalMainThreadTasks.fetch_add(static_cast<uint64_t>(stats.total), std::memory_order_relaxed);
+        mStats.totalMainThreadSyncTasks.fetch_add(static_cast<uint64_t>(stats.sync), std::memory_order_relaxed);
+        mStats.totalMainThreadAsyncTasks.fetch_add(static_cast<uint64_t>(stats.async), std::memory_order_relaxed);
+        mStats.totalMainThreadTaskProcessTimeUs.fetch_add(stats.elapsedUs, std::memory_order_relaxed);
+        updateMax(mStats.maxMainThreadTaskProcessTimeUs, stats.elapsedUs);
     }
-    return count;
+    return stats.total;
 }
 
 void ParallelDimensionTickManager::serialFallbackTick(const std::vector<Dimension*>& dimensions) {
