@@ -21,11 +21,11 @@ static Config                           config;
 static std::shared_ptr<ll::io::Logger> log;
 static bool                             hookInstalled = false;
 
-static thread_local DimensionWorkerContext* tl_currentContext            = nullptr;
-static thread_local bool                    tl_isWorkerThread            = false;
-static thread_local bool                    tl_insideNormalTickChain     = false;
-static thread_local int                     tl_currentDimTypeId          = -1;
-static thread_local const char*             tl_currentPhase              = "idle";
+static thread_local DimensionWorkerContext* tl_currentContext        = nullptr;
+static thread_local bool                    tl_isWorkerThread        = false;
+static thread_local bool                    tl_insideNormalTickChain = false;
+static thread_local int                     tl_currentDimTypeId      = -1;
+static thread_local const char*             tl_currentPhase          = "idle";
 
 // 危险函数恢复：funcName -> recoverAtTick
 static std::unordered_map<std::string, uint64_t> g_dangerousFunctions;
@@ -332,6 +332,11 @@ void ParallelNormalTickManager::shutdown() {
         mContexts.clear();
     }
 
+    {
+        std::lock_guard lock(mActorQuarantineMutex);
+        mActorMainThreadUntilTick.clear();
+    }
+
     mCurrentTick.store(0, std::memory_order_release);
     mInitialized = false;
     logger().info("Shutdown");
@@ -416,6 +421,40 @@ bool ParallelNormalTickManager::isFunctionDangerous(const std::string& funcName)
     return true;
 }
 
+void ParallelNormalTickManager::quarantineActor(Actor* actor, uint64_t untilTick) {
+    if (actor == nullptr) {
+        return;
+    }
+
+    std::lock_guard lock(mActorQuarantineMutex);
+    auto& current = mActorMainThreadUntilTick[actor];
+    if (current < untilTick) {
+        current = untilTick;
+    }
+}
+
+bool ParallelNormalTickManager::isActorQuarantined(Actor* actor, uint64_t nowTick) const {
+    if (actor == nullptr) {
+        return false;
+    }
+
+    std::lock_guard lock(mActorQuarantineMutex);
+    auto it = mActorMainThreadUntilTick.find(actor);
+    return it != mActorMainThreadUntilTick.end() && nowTick < it->second;
+}
+
+void ParallelNormalTickManager::cleanupActorQuarantine(uint64_t nowTick) {
+    std::lock_guard lock(mActorQuarantineMutex);
+
+    for (auto it = mActorMainThreadUntilTick.begin(); it != mActorMainThreadUntilTick.end();) {
+        if (nowTick >= it->second) {
+            it = mActorMainThreadUntilTick.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
 void ParallelNormalTickManager::beginLevelTick(Level* level) {
     if (!mInitialized || !config.parallelNormalTick || !level) {
         mInLevelTick = false;
@@ -425,6 +464,7 @@ void ParallelNormalTickManager::beginLevelTick(Level* level) {
     mSnapshot.time      = level->getTime();
     mSnapshot.simPaused = level->getSimPaused();
     mCurrentTick.store(static_cast<uint64_t>(mSnapshot.time), std::memory_order_release);
+    cleanupActorQuarantine(static_cast<uint64_t>(mSnapshot.time));
     mInLevelTick = !mSnapshot.simPaused;
 }
 
@@ -486,7 +526,14 @@ void ParallelNormalTickManager::workerLoop(DimensionWorkerContext* ctx) {
 
         try {
             tl_currentPhase = task.debugName.c_str();
-            task.fn();
+
+            if (task.actor == nullptr ||
+                static_cast<int>(task.actor->getDimensionId()) != task.scheduledDimensionId) {
+                task.result->dimensionMismatchBeforeRun = true;
+            } else {
+                task.fn();
+            }
+
             tl_currentPhase = "idle";
         } catch (...) {
             taskException = std::current_exception();
@@ -498,13 +545,14 @@ void ParallelNormalTickManager::workerLoop(DimensionWorkerContext* ctx) {
             std::chrono::duration_cast<std::chrono::microseconds>(end - start).count()
         );
 
-        if (task.sync) {
+        if (task.result) {
             {
-                std::lock_guard syncLock(task.sync->mutex);
-                task.sync->done      = true;
-                task.sync->exception = taskException;
+                std::lock_guard resultLock(task.result->mutex);
+                task.result->done = true;
+                task.result->exception = taskException;
+                task.result->execTimeUs = ctx->lastTaskTimeUs;
             }
-            task.sync->cv.notify_one();
+            task.result->cv.notify_one();
         }
     }
 
@@ -527,25 +575,29 @@ void ParallelNormalTickManager::runActorNormalTick(Actor& actor, const char* fun
         return;
     }
 
-    if (isFunctionDangerous(funcName)) {
+    const uint64_t nowTick = mCurrentTick.load(std::memory_order_acquire);
+
+    if (isFunctionDangerous(funcName) || isActorQuarantined(&actor, nowTick)) {
         fn();
         return;
     }
 
-    const int dimId = static_cast<int>(actor.getDimensionId());
-    auto* ctx = getOrCreateWorker(dimId);
+    const int scheduledDim = static_cast<int>(actor.getDimensionId());
+    auto* ctx = getOrCreateWorker(scheduledDim);
     if (ctx == nullptr) {
         fn();
         return;
     }
 
-    auto sync = std::make_shared<MainThreadTaskQueue::SyncState>();
+    auto result = std::make_shared<DimensionWorkerContext::TaskResult>();
 
     {
         std::lock_guard queueLock(ctx->queueMutex);
         DimensionWorkerContext::TaskItem task;
         task.fn = std::move(fn);
-        task.sync = sync;
+        task.result = result;
+        task.actor = &actor;
+        task.scheduledDimensionId = scheduledDim;
         task.debugName = funcName;
         ctx->tasks.push_back(std::move(task));
     }
@@ -557,8 +609,8 @@ void ParallelNormalTickManager::runActorNormalTick(Actor& actor, const char* fun
         processAllMainThreadTasks();
 
         {
-            std::unique_lock lock(sync->mutex);
-            if (sync->cv.wait_for(lock, std::chrono::milliseconds(1), [&sync] { return sync->done; })) {
+            std::unique_lock lock(result->mutex);
+            if (result->cv.wait_for(lock, std::chrono::milliseconds(1), [&result] { return result->done; })) {
                 break;
             }
         }
@@ -568,20 +620,43 @@ void ParallelNormalTickManager::runActorNormalTick(Actor& actor, const char* fun
     const uint64_t waitUs = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::microseconds>(waitEnd - waitStart).count()
     );
-    const uint64_t execUs = ctx->lastTaskTimeUs;
+
+    uint64_t execUs = 0;
+    bool dimensionMismatchBeforeRun = false;
+    std::exception_ptr taskException;
+
+    {
+        std::lock_guard lock(result->mutex);
+        execUs = result->execTimeUs;
+        dimensionMismatchBeforeRun = result->dimensionMismatchBeforeRun;
+        taskException = result->exception;
+    }
 
     recordNormalTickStats(execUs, waitUs);
 
-    if (sync->exception) {
+    if (dimensionMismatchBeforeRun) {
+        quarantineActor(&actor, nowTick + ACTOR_QUARANTINE_TICKS);
+        logger().warn(
+            "Actor normalTick dimension mismatch before worker run. func={} scheduledDim={} tick={}",
+            funcName,
+            scheduledDim,
+            nowTick
+        );
+        return;
+    }
+
+    if (taskException) {
         try {
-            std::rethrow_exception(sync->exception);
+            std::rethrow_exception(taskException);
         } catch (const std::exception& e) {
-            logger().error("Exception in {} on dim {}: {}", funcName, dimId, e.what());
+            logger().error("Exception in {} on dim {}: {}", funcName, scheduledDim, e.what());
         } catch (...) {
-            logger().error("Unknown exception in {} on dim {}", funcName, dimId);
+            logger().error("Unknown exception in {} on dim {}", funcName, scheduledDim);
         }
+
         markFunctionDangerous(funcName);
-        fn();
+        quarantineActor(&actor, nowTick + ACTOR_QUARANTINE_TICKS);
+        return;
     }
 }
 
