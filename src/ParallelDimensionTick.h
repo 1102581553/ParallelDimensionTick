@@ -26,11 +26,10 @@ class Level;
 namespace dim_parallel {
 
 struct Config {
-    int  version                = 3;
-    bool enabled                = true;
-    bool debug                  = false;
-    bool parallelActorPhase     = true;
-    bool parallelDimensionPhase = true;
+    int  version            = 4;
+    bool enabled            = true;
+    bool debug              = false;
+    bool parallelActorPhase = true;
 };
 
 Config&         getConfig();
@@ -70,35 +69,17 @@ private:
     std::vector<TaskItem> mProcessing;
 };
 
-enum class ActorPhaseMask : uint32_t {
-    None          = 0,
-    BaseTick      = 1u << 0,
-    NormalTick    = 1u << 1,
-    PassengerTick = 1u << 2,
-    MobAiStep     = 1u << 3,
+enum class ActorTickPhase : uint8_t {
+    None = 0,
+    BaseTick,
+    NormalTick,
+    AiStep,
+    PassengerTick,
 };
 
-constexpr ActorPhaseMask operator|(ActorPhaseMask a, ActorPhaseMask b) noexcept {
-    return static_cast<ActorPhaseMask>(
-        static_cast<uint32_t>(a) | static_cast<uint32_t>(b)
-    );
-}
-
-constexpr ActorPhaseMask operator&(ActorPhaseMask a, ActorPhaseMask b) noexcept {
-    return static_cast<ActorPhaseMask>(
-        static_cast<uint32_t>(a) & static_cast<uint32_t>(b)
-    );
-}
-
-constexpr ActorPhaseMask& operator|=(ActorPhaseMask& a, ActorPhaseMask b) noexcept {
-    a = a | b;
-    return a;
-}
-
 struct ActorWorkItem {
-    Actor*         actor     = nullptr;
-    ActorPhaseMask phaseMask = ActorPhaseMask::None;
-    bool           isMob     = false;
+    Actor* actor = nullptr;
+    bool   isMob = false;
 };
 
 struct LevelTickSnapshot {
@@ -107,22 +88,12 @@ struct LevelTickSnapshot {
 };
 
 struct DimensionWorkerContext {
-    enum class JobType : uint8_t {
-        None = 0,
-        ActorPhase,
-        DimensionPhase,
-    };
-
-    Dimension*              dimension   = nullptr;
-    int                     dimensionId = -1;
-
+    int                        dimensionId = -1;
+    ActorTickPhase             phase       = ActorTickPhase::None;
     std::vector<ActorWorkItem> actorTasks;
-    JobType                    jobType = JobType::None;
 
-    uint64_t lastActorPhaseTimeUs    = 0;
-    uint64_t lastDimensionTickTimeUs = 0;
-    uint64_t lastActorPhaseCallCount = 0;
-    uint64_t lastActorCount          = 0;
+    uint64_t lastWorkTimeUs   = 0;
+    uint64_t lastActorCount   = 0;
 
     std::thread             workerThread;
     std::mutex              wakeMutex;
@@ -132,18 +103,17 @@ struct DimensionWorkerContext {
     std::atomic<bool>       jobCompleted{false};
 };
 
-class ParallelDimensionTickManager {
+class ParallelActorTickManager {
 public:
-    static ParallelDimensionTickManager& getInstance();
+    static ParallelActorTickManager& getInstance();
 
     void initialize();
     void shutdown();
 
-    void dispatchActorPhase(
-        Level* level,
-        std::unordered_map<int, std::vector<ActorWorkItem>> tasksByDim
-    );
-    void dispatchDimensionPhase(Level* level, std::vector<Dimension*> dimensions);
+    void beginLevelTick(Level* level);
+    void endLevelTick();
+
+    bool interceptActorPhase(Actor& actor, ActorTickPhase phase, bool isMob);
 
     bool isStopping() const;
 
@@ -160,23 +130,13 @@ public:
 
         std::atomic<uint64_t> totalActorDispatches{0};
         std::atomic<uint64_t> totalActorBatches{0};
-        std::atomic<uint64_t> totalActorPhaseCalls{0};
         std::atomic<uint64_t> totalActorDispatchTimeUs{0};
         std::atomic<uint64_t> maxActorDispatchTimeUs{0};
         std::atomic<uint64_t> totalActorWaitTimeUs{0};
         std::atomic<uint64_t> maxActorWaitTimeUs{0};
         std::atomic<uint64_t> totalActorWorkTimeUs{0};
         std::atomic<uint64_t> maxActorWorkTimeUs{0};
-
-        std::atomic<uint64_t> totalParallelDimensionTicks{0};
-        std::atomic<uint64_t> totalFallbackDimensionTicks{0};
-        std::atomic<uint64_t> totalDimensionDispatchTimeUs{0};
-        std::atomic<uint64_t> maxDimensionDispatchTimeUs{0};
-        std::atomic<uint64_t> totalDimensionWaitTimeUs{0};
-        std::atomic<uint64_t> maxDimensionWaitTimeUs{0};
-        std::atomic<uint64_t> totalAllDimTickTimeUs{0};
-        std::atomic<uint64_t> maxAllDimTickTimeUs{0};
-        std::atomic<uint64_t> maxSingleDimTickTimeUs{0};
+        std::atomic<uint64_t> maxSingleDimActorTimeUs{0};
 
         std::atomic<uint64_t> totalMainThreadTasks{0};
         std::atomic<uint64_t> totalMainThreadSyncTasks{0};
@@ -191,9 +151,6 @@ public:
         std::atomic<uint64_t> totalLevelHookTimeUs{0};
         std::atomic<uint64_t> maxLevelHookTimeUs{0};
 
-        std::atomic<uint64_t> totalFallbackTimeUs{0};
-        std::atomic<uint64_t> maxFallbackTimeUs{0};
-
         std::atomic<uint64_t> totalMainThreadTaskProcessTimeUs{0};
         std::atomic<uint64_t> maxMainThreadTaskProcessTimeUs{0};
 
@@ -202,23 +159,13 @@ public:
 
             totalActorDispatches.store(0, std::memory_order_relaxed);
             totalActorBatches.store(0, std::memory_order_relaxed);
-            totalActorPhaseCalls.store(0, std::memory_order_relaxed);
             totalActorDispatchTimeUs.store(0, std::memory_order_relaxed);
             maxActorDispatchTimeUs.store(0, std::memory_order_relaxed);
             totalActorWaitTimeUs.store(0, std::memory_order_relaxed);
             maxActorWaitTimeUs.store(0, std::memory_order_relaxed);
             totalActorWorkTimeUs.store(0, std::memory_order_relaxed);
             maxActorWorkTimeUs.store(0, std::memory_order_relaxed);
-
-            totalParallelDimensionTicks.store(0, std::memory_order_relaxed);
-            totalFallbackDimensionTicks.store(0, std::memory_order_relaxed);
-            totalDimensionDispatchTimeUs.store(0, std::memory_order_relaxed);
-            maxDimensionDispatchTimeUs.store(0, std::memory_order_relaxed);
-            totalDimensionWaitTimeUs.store(0, std::memory_order_relaxed);
-            maxDimensionWaitTimeUs.store(0, std::memory_order_relaxed);
-            totalAllDimTickTimeUs.store(0, std::memory_order_relaxed);
-            maxAllDimTickTimeUs.store(0, std::memory_order_relaxed);
-            maxSingleDimTickTimeUs.store(0, std::memory_order_relaxed);
+            maxSingleDimActorTimeUs.store(0, std::memory_order_relaxed);
 
             totalMainThreadTasks.store(0, std::memory_order_relaxed);
             totalMainThreadSyncTasks.store(0, std::memory_order_relaxed);
@@ -233,9 +180,6 @@ public:
             totalLevelHookTimeUs.store(0, std::memory_order_relaxed);
             maxLevelHookTimeUs.store(0, std::memory_order_relaxed);
 
-            totalFallbackTimeUs.store(0, std::memory_order_relaxed);
-            maxFallbackTimeUs.store(0, std::memory_order_relaxed);
-
             totalMainThreadTaskProcessTimeUs.store(0, std::memory_order_relaxed);
             maxMainThreadTaskProcessTimeUs.store(0, std::memory_order_relaxed);
         }
@@ -246,14 +190,18 @@ public:
     void recordLevelTickStats(uint64_t levelOriginUs, uint64_t levelHookUs);
 
 private:
-    ParallelDimensionTickManager() = default;
+    ParallelActorTickManager() = default;
+
+    struct CollectedPhaseBucket {
+        std::vector<ActorWorkItem>         items;
+        std::unordered_map<Actor*, size_t> index;
+    };
 
     struct WindowStats {
         uint64_t levelTicks = 0;
 
         uint64_t actorDispatches = 0;
         uint64_t actorBatches    = 0;
-        uint64_t actorPhaseCalls = 0;
         uint64_t totalActorDispatchTimeUs = 0;
         uint64_t maxActorDispatchTimeUs   = 0;
         uint64_t totalActorWaitTimeUs     = 0;
@@ -261,25 +209,11 @@ private:
         uint64_t totalActorWorkTimeUs     = 0;
         uint64_t maxActorWorkTimeUs       = 0;
 
-        uint64_t parallelDimensionTicks = 0;
-        uint64_t fallbackDimensionTicks = 0;
-        uint64_t totalDimensionDispatchTimeUs = 0;
-        uint64_t maxDimensionDispatchTimeUs   = 0;
-        uint64_t totalDimensionWaitTimeUs     = 0;
-        uint64_t maxDimensionWaitTimeUs       = 0;
-        uint64_t totalAllDimTickTimeUs        = 0;
-        uint64_t maxAllDimTickTimeUs          = 0;
-        uint64_t totalDispatchDims            = 0;
-        uint64_t maxDispatchDims              = 0;
-
         uint64_t totalLevelOriginTimeUs = 0;
         uint64_t maxLevelOriginTimeUs   = 0;
 
         uint64_t totalLevelHookTimeUs = 0;
         uint64_t maxLevelHookTimeUs   = 0;
-
-        uint64_t totalFallbackTimeUs = 0;
-        uint64_t maxFallbackTimeUs   = 0;
 
         uint64_t totalMainThreadTasks = 0;
         uint64_t totalMainThreadSyncTasks = 0;
@@ -291,37 +225,38 @@ private:
 
     void     workerLoop(DimensionWorkerContext* ctx);
     void     processActorPhaseOnWorker(DimensionWorkerContext& ctx);
-    void     tickDimensionOnWorker(DimensionWorkerContext& ctx);
     size_t   processAllMainThreadTasks();
-    void     serialFallbackDimensionTick(const std::vector<Dimension*>& dimensions);
+    void     flushCurrentPhase();
+    void     clearCurrentPhaseBuckets();
+    void     collectActor(Actor& actor, bool isMob);
     void     notifyDispatchProgress();
     uint64_t getCurrentTick() const;
+    void     maybeLogWindowStats();
 
     void recordActorPhaseStats(
         uint64_t dispatchUs,
         uint64_t waitUs,
         uint64_t workUs,
-        uint64_t actorCount,
-        uint64_t phaseCalls
+        uint64_t actorCount
     );
-    void recordDimensionPhaseStats(
-        uint64_t dispatchUs,
-        uint64_t waitUs,
-        uint64_t allDimUs,
-        size_t   dims
-    );
-    void recordFallbackStats(uint64_t fallbackUs);
-    void maybeLogWindowStats();
+
+    static int phaseOrder(ActorTickPhase phase);
+    static const char* phaseName(ActorTickPhase phase);
 
     std::unordered_map<int, std::unique_ptr<DimensionWorkerContext>> mContexts;
     std::mutex                                                       mContextsMutex;
 
+    std::unordered_map<int, CollectedPhaseBucket>                    mCurrentPhaseBuckets;
+
     LevelTickSnapshot                                                mSnapshot;
     std::atomic<uint64_t>                                            mCurrentTick{0};
-    std::atomic<bool>                                                mFallbackToSerial{false};
     std::atomic<bool>                                                mStopping{false};
     std::atomic<uint32_t>                                            mActiveDispatches{0};
     bool                                                             mInitialized = false;
+    bool                                                             mInLevelTick = false;
+    bool                                                             mBypassCurrentTick = false;
+    ActorTickPhase                                                   mCurrentPhase = ActorTickPhase::None;
+
     Stats                                                            mStats;
     WindowStats                                                      mWindowStats;
 
@@ -332,8 +267,6 @@ private:
 
     static constexpr uint64_t RECOVERY_INTERVAL_TICKS = 20;
     static constexpr uint64_t DEBUG_WINDOW_TICKS      = 200;
-
-    uint64_t mFallbackStartTick = 0;
 };
 
 class PluginImpl {
