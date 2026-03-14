@@ -16,44 +16,36 @@
 #include <filesystem>
 #include <algorithm>
 #include <cstring>
+#include <thread>
 
 namespace dim_parallel {
-
 static Config config;
 static std::shared_ptr<ll::io::Logger> log;
 static bool hookInstalled = false;
-
 static thread_local DimensionFiberContext* tl_currentContext = nullptr;
 static thread_local bool tl_isWorkerThread = false;
 static thread_local int tl_currentDimTypeId = -1;
 static thread_local char tl_currentPhase[64] = "idle";
-
 static std::atomic<bool> g_inParallelPhase{false};
 static std::atomic<bool> g_suppressDimensionTick{false};
-
 static std::vector<Dimension*> g_collectedDimensions;
 static std::mutex g_dimensionCollectionMutex;
 
-// === 新增：将 tl_workerMainFiber 定义移到此处（在 dimFiberProc 之前） ===
 thread_local void* tl_workerMainFiber = nullptr;
-
 std::unordered_set<std::string> ParallelDimensionTickManager::m_dangerousFunctions;
 std::mutex ParallelDimensionTickManager::m_dangerousMutex;
 
 Config& getConfig() { return config; }
-
 ll::io::Logger& logger() {
     if (!log) {
         log = ll::io::LoggerRegistry::getInstance().getOrCreate("DimParallel");
     }
     return *log;
 }
-
 bool loadConfig() {
     auto path = PluginImpl::getInstance().getSelf().getConfigDir() / "config.json";
     return ll::config::loadConfig(config, path);
 }
-
 bool saveConfig() {
     auto path = PluginImpl::getInstance().getSelf().getConfigDir() / "config.json";
     return ll::config::saveConfig(config, path);
@@ -62,7 +54,6 @@ bool saveConfig() {
 //=============================================================================
 // ParallelDimensionTickManager
 //=============================================================================
-
 ParallelDimensionTickManager& ParallelDimensionTickManager::getInstance() {
     static ParallelDimensionTickManager instance;
     return instance;
@@ -72,15 +63,23 @@ void ParallelDimensionTickManager::initialize() {
     if (mInitialized) return;
     mFallbackToSerial = false;
     mFallbackStartTick = 0;
-
     SYSTEM_INFO sysInfo;
     GetSystemInfo(&sysInfo);
     mWorkerCount = static_cast<int>(sysInfo.dwNumberOfProcessors) - 1;
     if (mWorkerCount < 1) mWorkerCount = 1;
-
     mInitialized = true;
-    logger().info("已初始化 Fiber-per-Thread 并行模型（CPU: {}, 工作线程: {}）",
-        sysInfo.dwNumberOfProcessors, mWorkerCount);
+
+    // === 强制标记所有危险函数 ===
+    const char* dangerous[] = {
+        "tickRedstone", "_sendBlocksChangedPackets",
+        "_processEntityChunkTransfers", "_tickEntityChunkMoves",
+        "_runChunkGenerationWatchdog", "sendBroadcast",
+        "sendPacketForPosition", "sendPacketForEntity"
+    };
+    for (auto* f : dangerous) markFunctionDangerous(f);
+
+    logger().info("维度并行已初始化（Fiber-per-Thread + 无锁队列，CPU: {}, 工作线程: {}, 强制转发 {} 个危险函数）",
+        sysInfo.dwNumberOfProcessors, mWorkerCount, sizeof(dangerous)/sizeof(dangerous[0]));
 }
 
 void ParallelDimensionTickManager::shutdown() {
@@ -93,7 +92,6 @@ void ParallelDimensionTickManager::shutdown() {
             CloseHandle(ctx->workerThread);
             ctx->workerThread = nullptr;
         }
-        // fiber 由工作线程创建和销毁，这里不需要处理
     }
     mContexts.clear();
     mInitialized = false;
@@ -101,7 +99,6 @@ void ParallelDimensionTickManager::shutdown() {
 }
 
 bool ParallelDimensionTickManager::isWorkerThread() { return tl_isWorkerThread; }
-
 DimensionFiberContext* ParallelDimensionTickManager::getCurrentContext() { return tl_currentContext; }
 
 void ParallelDimensionTickManager::runOnMainThread(std::function<void()> task) {
@@ -115,7 +112,7 @@ void ParallelDimensionTickManager::runOnMainThread(std::function<void()> task) {
 void ParallelDimensionTickManager::markFunctionDangerous(const std::string& funcName) {
     std::lock_guard lock(m_dangerousMutex);
     if (m_dangerousFunctions.insert(funcName).second) {
-        logger().warn("自动适应：'{}' 已标记为危险（将转发到主线程）", funcName);
+        logger().warn("自动适应：'{}' 已标记为危险（强制转发主线程）", funcName);
         getInstance().mStats.totalDangerousFunctions++;
     }
 }
@@ -128,7 +125,6 @@ bool ParallelDimensionTickManager::isFunctionDangerous(const std::string& funcNa
 //=============================================================================
 // SEH 包装
 //=============================================================================
-
 static DWORD executeDimTickSafe(Dimension* dim) {
     __try {
         if (dim) {
@@ -144,55 +140,39 @@ static DWORD executeDimTickSafe(Dimension* dim) {
 //=============================================================================
 // 维度 Fiber 入口
 //=============================================================================
-
 void CALLBACK ParallelDimensionTickManager::dimFiberProc(LPVOID param) {
     auto* ctx = static_cast<DimensionFiberContext*>(param);
-
-    // fiber 循环：每次被切换进来执行一次 tick，然后切回工作线程 fiber
     while (true) {
         ctx->tickDone = false;
         ctx->faulted = false;
         ctx->exceptionCode = 0;
-
         if (ctx->dimensionPtr) {
             auto start = std::chrono::steady_clock::now();
-
             DWORD code = executeDimTickSafe(ctx->dimensionPtr);
-
             auto end = std::chrono::steady_clock::now();
             ctx->lastTickTimeUs =
                 std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-
             if (code != 0) {
                 ctx->faulted = true;
                 ctx->exceptionCode = code;
             }
         }
-
         ctx->tickDone = true;
-
-        // 直接使用 tl_workerMainFiber（已在命名空间内定义），无需 extern 声明
         if (tl_workerMainFiber) {
             SwitchToFiber(tl_workerMainFiber);
         }
-        // 如果切回失败，fiber 会在这里死循环等待下次切入
     }
 }
 
 //=============================================================================
-// 工作线程：每个维度一个线程，线程内用 fiber 执行 tick
+// 工作线程
 //=============================================================================
-
-// tl_workerMainFiber 的定义已经移到文件顶部
-
 DWORD WINAPI ParallelDimensionTickManager::workerThreadProc(LPVOID param) {
     auto* ctx = static_cast<DimensionFiberContext*>(param);
-
     tl_isWorkerThread = true;
     tl_currentContext = ctx;
     tl_currentDimTypeId = ctx->dimId;
 
-    // 将工作线程转换为 fiber
     tl_workerMainFiber = ConvertThreadToFiber(nullptr);
     if (!tl_workerMainFiber) {
         logger().error("维度 {} 工作线程 ConvertThreadToFiber 失败 (错误: {})",
@@ -200,23 +180,19 @@ DWORD WINAPI ParallelDimensionTickManager::workerThreadProc(LPVOID param) {
         return 1;
     }
 
-    // 创建维度 tick fiber（8MB 栈）
     ctx->dimFiber = CreateFiber(
         8 * 1024 * 1024,
         &ParallelDimensionTickManager::dimFiberProc,
         ctx
     );
-
     if (!ctx->dimFiber) {
         logger().error("维度 {} CreateFiber 失败 (错误: {})", ctx->dimId, GetLastError());
         ConvertFiberToThread();
         return 1;
     }
-
     logger().info("维度 {} fiber 工作线程就绪", ctx->dimId);
 
     while (true) {
-        // 等待调度信号
         {
             std::unique_lock lock(ctx->wakeMutex);
             ctx->wakeCV.wait(lock, [ctx] {
@@ -224,26 +200,16 @@ DWORD WINAPI ParallelDimensionTickManager::workerThreadProc(LPVOID param) {
                        ctx->shutdown.load(std::memory_order_acquire);
             });
         }
-
         if (ctx->shutdown.load(std::memory_order_acquire)) break;
-
         ctx->shouldWork.store(false, std::memory_order_release);
-
         std::atomic_thread_fence(std::memory_order_acquire);
-
         if (ctx->dimensionPtr && ctx->dimFiber) {
             tl_currentDimTypeId = ctx->dimensionPtr->getDimensionId();
             strncpy_s(tl_currentPhase, "tick", _TRUNCATE);
-
-            // 切换到维度 fiber 执行 tick
             SwitchToFiber(ctx->dimFiber);
-
-            // tick 完成，回到这里
             strncpy_s(tl_currentPhase, "idle", _TRUNCATE);
-
             if (ctx->faulted) {
                 getInstance().mStats.totalSEHCaught.fetch_add(1, std::memory_order_relaxed);
-
                 if (ctx->exceptionCode == 0xC0000409) {
                     logger().error("维度 {} GS cookie 失败，销毁 fiber", ctx->dimId);
                 } else if (ctx->exceptionCode == 0xC0000005) {
@@ -251,30 +217,24 @@ DWORD WINAPI ParallelDimensionTickManager::workerThreadProc(LPVOID param) {
                 } else {
                     logger().error("维度 {} SEH 异常 (0x{:X})", ctx->dimId, ctx->exceptionCode);
                 }
-
-                // 销毁出错的 fiber，下次重建
                 DeleteFiber(ctx->dimFiber);
                 ctx->dimFiber = CreateFiber(
                     8 * 1024 * 1024,
                     &ParallelDimensionTickManager::dimFiberProc,
                     ctx
                 );
-
                 getInstance().mFallbackToSerial.store(true, std::memory_order_relaxed);
             }
         }
-
         ctx->isProcessing.store(false, std::memory_order_release);
         ctx->tickCompleted.store(true, std::memory_order_release);
     }
 
-    // 清理
     if (ctx->dimFiber) {
         DeleteFiber(ctx->dimFiber);
         ctx->dimFiber = nullptr;
     }
     ConvertFiberToThread();
-
     tl_isWorkerThread = false;
     tl_currentContext = nullptr;
     tl_workerMainFiber = nullptr;
@@ -282,9 +242,27 @@ DWORD WINAPI ParallelDimensionTickManager::workerThreadProc(LPVOID param) {
 }
 
 //=============================================================================
-// 调度
+// 强制转发危险函数
 //=============================================================================
+template<typename Func, typename... Args>
+inline void handleDangerousFunction(const char* funcName, Func&& func, Args&&... args) {
+    if (!config.enabled) {
+        std::forward<Func>(func)(std::forward<Args>(args)...);
+        return;
+    }
+    if (ParallelDimensionTickManager::isWorkerThread()) {
+        auto bound = std::bind(std::forward<Func>(func), std::forward<Args>(args)...);
+        ParallelDimensionTickManager::runOnMainThread([bound = std::move(bound)]() mutable {
+            bound();
+        });
+        return;
+    }
+    std::forward<Func>(func)(std::forward<Args>(args)...);
+}
 
+//=============================================================================
+// 调度（轮询服务循环 + 无锁队列）
+//=============================================================================
 void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
     if (!level || !mInitialized) {
         std::vector<Dimension*> dimRefs;
@@ -295,7 +273,6 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
         serialFallbackTick(dimRefs);
         return;
     }
-
     if (level->getSimPaused()) return;
 
     std::vector<Dimension*> dimRefs;
@@ -303,7 +280,6 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
         std::lock_guard<std::mutex> lock(g_dimensionCollectionMutex);
         dimRefs = g_collectedDimensions;
     }
-
     if (dimRefs.empty()) return;
 
     std::vector<Dimension*> validDims;
@@ -314,7 +290,6 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
             mStats.totalSkippedDimensions++;
         }
     }
-
     if (validDims.empty()) return;
 
     if (validDims.size() == 1) {
@@ -352,21 +327,18 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
             ctx->tickNumber.store(0, std::memory_order_relaxed);
             ctx->skippedTicks.store(0, std::memory_order_relaxed);
             ctx->totalSkippedTicks.store(0, std::memory_order_relaxed);
-
             ctx->workerThread = CreateThread(
                 nullptr,
-                0, // 默认栈，fiber 有自己的栈
+                0,
                 &ParallelDimensionTickManager::workerThreadProc,
                 ctx.get(),
                 0,
                 nullptr
             );
-
             if (!ctx->workerThread) {
                 logger().error("创建维度 {} 工作线程失败 (错误: {})", dimId, GetLastError());
                 continue;
             }
-
             mContexts[dimId] = std::move(ctx);
         }
     }
@@ -377,51 +349,74 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
         auto ctxIt = mContexts.find(dimId);
         if (ctxIt == mContexts.end()) continue;
         auto& ctx = *ctxIt->second;
-
         if (ctx.isProcessing.load(std::memory_order_acquire)) {
             uint64_t skipped = ctx.skippedTicks.fetch_add(1, std::memory_order_relaxed) + 1;
             ctx.totalSkippedTicks.fetch_add(1, std::memory_order_relaxed);
             mStats.totalTicksSkippedDueToBacklog.fetch_add(1, std::memory_order_relaxed);
-
             if (config.debug && skipped % 20 == 0) {
                 logger().warn("维度 {} 已跳过 {} 个连续 tick（总计：{}）",
                     dimId, skipped, ctx.totalSkippedTicks.load(std::memory_order_relaxed));
             }
             continue;
         }
-
         uint64_t prevSkipped = ctx.skippedTicks.exchange(0, std::memory_order_relaxed);
         if (prevSkipped > 0 && config.debug) {
             logger().info("维度 {} 在跳过 {} 个 tick 后恢复", dimId, prevSkipped);
         }
-
         ctx.dimensionPtr = dim;
         std::atomic_thread_fence(std::memory_order_release);
-
         ctx.tickCompleted.store(false, std::memory_order_release);
         ctx.isProcessing.store(true, std::memory_order_release);
         ctx.tickNumber.fetch_add(1, std::memory_order_relaxed);
-
         ctx.shouldWork.store(true, std::memory_order_release);
         ctx.wakeCV.notify_one();
     }
 
-    // 非阻塞处理已完成维度的主线程任务
+    // === 主线程轮询服务循环（处理无锁队列 + 等待所有维度完成）===
     uint64_t totalTasksThisCycle = 0;
+    bool allCompleted = false;
+    int maxLoops = 10000;
+    while (!allCompleted && maxLoops-- > 0) {
+        allCompleted = true;
+        uint64_t tasksThisLoop = 0;
+
+        for (auto* dim : validDims) {
+            int dimId = dim->getDimensionId();
+            auto ctxIt = mContexts.find(dimId);
+            if (ctxIt == mContexts.end()) continue;
+            auto& ctx = *ctxIt->second;
+
+            size_t taskCount = ctx.mainThreadTasks.size();
+            if (taskCount > 0) {
+                ctx.mainThreadTasks.processAll();
+                tasksThisLoop += taskCount;
+            }
+
+            if (ctx.isProcessing.load(std::memory_order_acquire) &&
+                !ctx.tickCompleted.load(std::memory_order_acquire)) {
+                allCompleted = false;
+            }
+        }
+
+        totalTasksThisCycle += tasksThisLoop;
+        if (!allCompleted) {
+            std::this_thread::yield();
+        }
+    }
+
+    if (totalTasksThisCycle > 0) {
+        mStats.totalMainThreadTasks.fetch_add(totalTasksThisCycle, std::memory_order_relaxed);
+        mStats.cycleMainThreadTasks.fetch_add(totalTasksThisCycle, std::memory_order_relaxed);
+    }
+
+    // 收尾处理
     for (auto* dim : validDims) {
         int dimId = dim->getDimensionId();
         auto ctxIt = mContexts.find(dimId);
         if (ctxIt == mContexts.end()) continue;
         auto& ctx = *ctxIt->second;
-
         if (ctx.tickCompleted.load(std::memory_order_acquire)) {
-            size_t taskCount = ctx.mainThreadTasks.size();
-            if (taskCount > 0) {
-                ctx.mainThreadTasks.processAll();
-                totalTasksThisCycle += taskCount;
-            }
             ctx.tickCompleted.store(false, std::memory_order_release);
-
             if (ctx.faulted) {
                 logger().warn("维度 {} 出错，运行串行恢复 tick", dimId);
                 try {
@@ -434,15 +429,9 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
         }
     }
 
-    if (totalTasksThisCycle > 0) {
-        mStats.totalMainThreadTasks.fetch_add(totalTasksThisCycle, std::memory_order_relaxed);
-        mStats.cycleMainThreadTasks.fetch_add(totalTasksThisCycle, std::memory_order_relaxed);
-    }
-
     if (mFallbackToSerial.load(std::memory_order_relaxed) && mFallbackStartTick == 0) {
         mFallbackStartTick = level->getTime();
     }
-
     mStats.totalParallelTicks.fetch_add(1, std::memory_order_relaxed);
 
     if (config.debug && (mStats.totalParallelTicks.load(std::memory_order_relaxed) % 200 == 0)) {
@@ -468,7 +457,6 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
                 ctx.totalSkippedTicks.load(std::memory_order_relaxed),
                 ctx.dimFiber ? "ok" : "destroyed");
         }
-
         std::lock_guard lock(m_dangerousMutex);
         if (!m_dangerousFunctions.empty()) {
             std::string funcs;
@@ -495,28 +483,6 @@ void ParallelDimensionTickManager::serialFallbackTick(const std::vector<Dimensio
 }
 
 //=============================================================================
-// Hook helper
-//=============================================================================
-
-template<typename Func, typename... Args>
-inline void handleDangerousFunction(const char* funcName, Func&& func, Args&&... args) {
-    if (!config.enabled) {
-        std::forward<Func>(func)(std::forward<Args>(args)...);
-        return;
-    }
-    if (ParallelDimensionTickManager::isWorkerThread()) {
-        if (ParallelDimensionTickManager::isFunctionDangerous(funcName)) {
-            auto bound = std::bind(std::forward<Func>(func), std::forward<Args>(args)...);
-            ParallelDimensionTickManager::runOnMainThread([bound = std::move(bound)]() mutable {
-                bound();
-            });
-            return;
-        }
-    }
-    std::forward<Func>(func)(std::forward<Args>(args)...);
-}
-
-//=============================================================================
 // Hooks
 //=============================================================================
 LL_TYPE_INSTANCE_HOOK(
@@ -536,36 +502,28 @@ LL_TYPE_INSTANCE_HOOK(
         return;
     }
     inHook = true;
-
     {
         std::lock_guard<std::mutex> lock(g_dimensionCollectionMutex);
         g_collectedDimensions.clear();
     }
-
     g_suppressDimensionTick.store(true, std::memory_order_release);
-
     this->forEachDimension([&](Dimension& dim) -> bool {
         std::lock_guard<std::mutex> lock(g_dimensionCollectionMutex);
         g_collectedDimensions.emplace_back(&dim);
         return true;
     });
-
     origin();
-
     g_suppressDimensionTick.store(false, std::memory_order_release);
-
     bool hasDimensions = false;
     {
         std::lock_guard<std::mutex> lock(g_dimensionCollectionMutex);
         hasDimensions = !g_collectedDimensions.empty();
     }
-
     if (hasDimensions) {
         g_inParallelPhase.store(true, std::memory_order_release);
         ParallelDimensionTickManager::getInstance().dispatchAndSync(this);
         g_inParallelPhase.store(false, std::memory_order_release);
     }
-
     inHook = false;
 }
 
@@ -710,12 +668,10 @@ LL_TYPE_INSTANCE_HOOK(
 //=============================================================================
 // Plugin Implementation
 //=============================================================================
-
 PluginImpl& PluginImpl::getInstance() {
     static PluginImpl instance;
     return instance;
 }
-
 bool PluginImpl::load() {
     std::filesystem::create_directories(getSelf().getConfigDir());
     if (!loadConfig()) {
@@ -725,7 +681,6 @@ bool PluginImpl::load() {
     logger().info("DimParallel 已加载。enabled={} debug={}", config.enabled, config.debug);
     return true;
 }
-
 bool PluginImpl::enable() {
     if (!hookInstalled) {
         LevelTickHook::hook();
@@ -744,7 +699,6 @@ bool PluginImpl::enable() {
     logger().info("DimParallel 已启用");
     return true;
 }
-
 bool PluginImpl::disable() {
     ParallelDimensionTickManager::getInstance().shutdown();
     if (hookInstalled) {
@@ -763,7 +717,6 @@ bool PluginImpl::disable() {
     logger().info("DimParallel 已禁用");
     return true;
 }
-
 } // namespace dim_parallel
 
 LL_REGISTER_MOD(dim_parallel::PluginImpl, dim_parallel::PluginImpl::getInstance());
