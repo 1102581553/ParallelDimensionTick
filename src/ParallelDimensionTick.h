@@ -42,9 +42,16 @@ public:
         std::exception_ptr      exception;
     };
 
+    struct ProcessStats {
+        size_t   total    = 0;
+        size_t   sync     = 0;
+        size_t   async    = 0;
+        uint64_t elapsedUs = 0;
+    };
+
     void                       enqueue(std::function<void()> task);
     std::shared_ptr<SyncState> enqueueSync(std::function<void()> task);
-    size_t                     processAll();
+    ProcessStats               processAll();
     size_t                     size() const;
 
 private:
@@ -53,7 +60,7 @@ private:
         std::shared_ptr<SyncState> sync;
     };
 
-    mutable std::mutex   mMutex;
+    mutable std::mutex    mMutex;
     std::vector<TaskItem> mTasks;
     std::vector<TaskItem> mProcessing;
 };
@@ -100,6 +107,26 @@ public:
         std::atomic<uint64_t> maxDimTickTimeUs{0};
         std::atomic<uint64_t> totalRecoveryAttempts{0};
         std::atomic<uint64_t> totalDangerousFunctions{0};
+
+        // 新增：主线程任务细分
+        std::atomic<uint64_t> totalMainThreadSyncTasks{0};
+        std::atomic<uint64_t> totalMainThreadAsyncTasks{0};
+
+        // 新增：整次 dispatch 耗时
+        std::atomic<uint64_t> totalDispatchTimeUs{0};
+        std::atomic<uint64_t> maxDispatchTimeUs{0};
+
+        // 新增：主线程任务处理耗时
+        std::atomic<uint64_t> totalMainThreadTaskProcessTimeUs{0};
+        std::atomic<uint64_t> maxMainThreadTaskProcessTimeUs{0};
+
+        // 新增：主线程等待 worker 的耗时
+        std::atomic<uint64_t> totalDispatchWaitTimeUs{0};
+        std::atomic<uint64_t> maxDispatchWaitTimeUs{0};
+
+        // 新增：所有维度 tick 耗时总和，用来观察并行收益
+        std::atomic<uint64_t> totalAllDimTickTimeUs{0};
+        std::atomic<uint64_t> maxAllDimTickTimeUs{0};
     };
 
     Stats& getStats() { return mStats; }
