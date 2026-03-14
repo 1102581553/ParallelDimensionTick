@@ -356,7 +356,7 @@ void ParallelDimensionTickManager::initialize() {
     mActiveDispatches.store(0, std::memory_order_release);
     mCurrentTick.store(0, std::memory_order_release);
 
-    mStats  = Stats{};
+    mStats.reset();
     mWindowStats = WindowStats{};
 
     mInitialized = true;
