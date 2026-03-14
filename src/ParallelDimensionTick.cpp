@@ -36,11 +36,9 @@ static std::atomic<bool>       g_suppressDimensionTick{false};
 static std::vector<Dimension*> g_collectedDimensions;
 static std::mutex              g_collectMutex;
 
-// Dangerous functions set
 static std::unordered_set<std::string> g_dangerousFunctions;
 static std::mutex                       g_dangerousMutex;
 
-// Definition of static member
 MainThreadTaskQueue ParallelDimensionTickManager::mMainThreadTasks;
 
 Config& getConfig() { return config; }
@@ -84,7 +82,7 @@ size_t MainThreadTaskQueue::size() const {
 }
 
 //=============================================================================
-// ParallelDimensionTickManager implementation with per-dimension threads
+// ParallelDimensionTickManager implementation
 //=============================================================================
 
 ParallelDimensionTickManager& ParallelDimensionTickManager::getInstance() {
@@ -103,7 +101,6 @@ void ParallelDimensionTickManager::initialize() {
 void ParallelDimensionTickManager::shutdown() {
     if (!mInitialized) return;
 
-    // Signal all worker threads to shut down and wait for them
     for (auto& [id, ctx] : mContexts) {
         if (ctx->workerThread.joinable()) {
             {
@@ -157,10 +154,8 @@ void ParallelDimensionTickManager::workerLoop(DimensionWorkerContext* ctx) {
         ctx->shouldWork = false;
         lock.unlock();
 
-        // Perform the dimension tick
         tickDimensionOnWorker(*ctx);
 
-        // Mark completion
         ctx->tickCompleted = true;
     }
 
@@ -187,27 +182,23 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
     auto& dimensions = g_collectedDimensions;
     if (dimensions.empty()) return;
 
-    // If only one dimension, just tick it directly (no parallelism overhead)
     if (dimensions.size() == 1) {
         dimensions[0]->tick();
         return;
     }
 
-    // Check if we are in fallback mode and attempt recovery if interval elapsed
-    if (mFallbackToSerial.load(std::memory_order_relaxed)) {
+    if (mFallbackToSerial.load(std::memory_order_acquire)) {
         uint64_t currentTick = level->getTime();
         if (currentTick - mFallbackStartTick >= RECOVERY_INTERVAL_TICKS) {
-            // Attempt recovery
             mStats.totalRecoveryAttempts++;
             logger().debug("Attempting recovery from fallback mode at tick {}", currentTick);
-            mFallbackToSerial.store(false, std::memory_order_relaxed);
+            mFallbackToSerial.store(false, std::memory_order_release);
         } else {
             serialFallbackTick(dimensions);
             return;
         }
     }
 
-    // Ensure each dimension has a worker thread
     for (auto* dim : dimensions) {
         int dimId = dim->getDimensionId();
         auto it = mContexts.find(dimId);
@@ -225,7 +216,6 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
         }
     }
 
-    // Reset completion flags and set work flags
     std::atomic<int> pendingCount(dimensions.size());
     for (auto* dim : dimensions) {
         int dimId = dim->getDimensionId();
@@ -238,7 +228,6 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
         ctx->wakeCV.notify_one();
     }
 
-    // Wait for all dimensions to complete their tick
     while (pendingCount.load(std::memory_order_relaxed) > 0) {
         for (auto* dim : dimensions) {
             int dimId = dim->getDimensionId();
@@ -255,11 +244,9 @@ void ParallelDimensionTickManager::dispatchAndSync(Level* level) {
         }
     }
 
-    // Process all main thread tasks that were queued during parallel tick
     processAllMainThreadTasks();
 
-    // If any dimension tick triggered fallback flag, we switch to serial mode and record start tick
-    if (mFallbackToSerial.load(std::memory_order_relaxed)) {
+    if (mFallbackToSerial.load(std::memory_order_acquire)) {
         mFallbackStartTick = level->getTime();
     }
 
@@ -288,25 +275,30 @@ void ParallelDimensionTickManager::tickDimensionOnWorker(DimensionWorkerContext&
     tl_currentPhase     = "pre-tick";
 
     auto start = std::chrono::steady_clock::now();
+    bool exceptionOccurred = false;
 
     try {
         tl_currentPhase = "tick";
         ctx.dimension->tick();
         tl_currentPhase = "post-tick";
     } catch (std::exception& e) {
+        exceptionOccurred = true;
         logger().error("std::exception in dim {} during [{}]: {}", tl_currentDimTypeId, tl_currentPhase, e.what());
         if (tl_currentPhase != nullptr && tl_currentPhase[0] != '\0' && 
             strcmp(tl_currentPhase, "pre-tick") != 0 && strcmp(tl_currentPhase, "post-tick") != 0) {
             markFunctionDangerous(tl_currentPhase);
         }
-        mFallbackToSerial.store(true, std::memory_order_relaxed);
     } catch (...) {
+        exceptionOccurred = true;
         logger().error("SEH/unknown exception in dim {} during [{}]", tl_currentDimTypeId, tl_currentPhase);
         if (tl_currentPhase != nullptr && tl_currentPhase[0] != '\0' && 
             strcmp(tl_currentPhase, "pre-tick") != 0 && strcmp(tl_currentPhase, "post-tick") != 0) {
             markFunctionDangerous(tl_currentPhase);
         }
-        mFallbackToSerial.store(true, std::memory_order_relaxed);
+    }
+
+    if (exceptionOccurred) {
+        mFallbackToSerial.store(true, std::memory_order_release);
     }
 
     auto end           = std::chrono::steady_clock::now();
@@ -348,10 +340,9 @@ inline void handleDangerousFunction(const char* funcName, Func&& func, Args&&...
     }
     if (ParallelDimensionTickManager::isWorkerThread()) {
         if (ParallelDimensionTickManager::isFunctionDangerous(funcName)) {
-            // Forward to main thread
-            auto bound = std::bind(std::forward<Func>(func), std::forward<Args>(args)...);
-            ParallelDimensionTickManager::runOnMainThread([bound = std::move(bound)]() mutable {
-                bound();
+            ParallelDimensionTickManager::runOnMainThread([funcName, func = std::forward<Func>(func), 
+                                                           ...capturedArgs = std::forward<Args>(args)]() mutable {
+                func(std::forward<decltype(capturedArgs)>(capturedArgs)...);
             });
             return;
         }
@@ -360,7 +351,7 @@ inline void handleDangerousFunction(const char* funcName, Func&& func, Args&&...
 }
 
 //=============================================================================
-// Hooks (all sub-functions now use handleDangerousFunction)
+// Hooks
 //=============================================================================
 
 LL_TYPE_INSTANCE_HOOK(
@@ -502,14 +493,23 @@ LL_TYPE_INSTANCE_HOOK(
         return;
     }
 
-    g_collectedDimensions.clear();
+    {
+        std::lock_guard lock(g_collectMutex);
+        g_collectedDimensions.clear();
+    }
     g_suppressDimensionTick.store(true, std::memory_order_release);
 
     origin();
 
     g_suppressDimensionTick.store(false, std::memory_order_release);
 
-    if (!g_collectedDimensions.empty()) {
+    std::vector<Dimension*> dims;
+    {
+        std::lock_guard lock(g_collectMutex);
+        dims = std::move(g_collectedDimensions);
+    }
+
+    if (!dims.empty()) {
         g_inParallelPhase.store(true, std::memory_order_release);
         ParallelDimensionTickManager::getInstance().dispatchAndSync(this);
         g_inParallelPhase.store(false, std::memory_order_release);
