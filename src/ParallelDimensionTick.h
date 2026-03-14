@@ -9,6 +9,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <exception>
 #include <functional>
 #include <memory>
@@ -19,17 +20,16 @@
 #include <vector>
 
 class Actor;
-class Mob;
 class Player;
 class Level;
 
 namespace dim_parallel {
 
 struct Config {
-    int  version            = 4;
+    int  version            = 5;
     bool enabled            = true;
     bool debug              = false;
-    bool parallelActorPhase = true;
+    bool parallelNormalTick = true;
 };
 
 Config&         getConfig();
@@ -69,43 +69,32 @@ private:
     std::vector<TaskItem> mProcessing;
 };
 
-enum class ActorTickPhase : uint8_t {
-    None = 0,
-    BaseTick,
-    NormalTick,
-    AiStep,
-    PassengerTick,
-};
-
-struct ActorWorkItem {
-    Actor* actor = nullptr;
-    bool   isMob = false;
-};
-
 struct LevelTickSnapshot {
     int  time      = 0;
     bool simPaused = false;
 };
 
 struct DimensionWorkerContext {
-    int                        dimensionId = -1;
-    ActorTickPhase             phase       = ActorTickPhase::None;
-    std::vector<ActorWorkItem> actorTasks;
+    struct TaskItem {
+        std::function<void()>      fn;
+        std::shared_ptr<MainThreadTaskQueue::SyncState> sync;
+        std::string                debugName;
+    };
 
-    uint64_t lastWorkTimeUs   = 0;
-    uint64_t lastActorCount   = 0;
+    int dimensionId = -1;
 
     std::thread             workerThread;
-    std::mutex              wakeMutex;
+    std::mutex              queueMutex;
     std::condition_variable wakeCV;
-    bool                    shouldWork = false;
-    bool                    shutdown   = false;
-    std::atomic<bool>       jobCompleted{false};
+    std::deque<TaskItem>    tasks;
+    bool                    shutdown = false;
+
+    uint64_t lastTaskTimeUs = 0;
 };
 
-class ParallelActorTickManager {
+class ParallelNormalTickManager {
 public:
-    static ParallelActorTickManager& getInstance();
+    static ParallelNormalTickManager& getInstance();
 
     void initialize();
     void shutdown();
@@ -113,7 +102,7 @@ public:
     void beginLevelTick(Level* level);
     void endLevelTick();
 
-    bool interceptActorPhase(Actor& actor, ActorTickPhase phase, bool isMob);
+    void runActorNormalTick(Actor& actor, const char* funcName, std::function<void()> fn);
 
     bool isStopping() const;
 
@@ -128,21 +117,16 @@ public:
     struct Stats {
         std::atomic<uint64_t> totalLevelTicks{0};
 
-        std::atomic<uint64_t> totalActorDispatches{0};
-        std::atomic<uint64_t> totalActorBatches{0};
-        std::atomic<uint64_t> totalActorDispatchTimeUs{0};
-        std::atomic<uint64_t> maxActorDispatchTimeUs{0};
-        std::atomic<uint64_t> totalActorWaitTimeUs{0};
-        std::atomic<uint64_t> maxActorWaitTimeUs{0};
-        std::atomic<uint64_t> totalActorWorkTimeUs{0};
-        std::atomic<uint64_t> maxActorWorkTimeUs{0};
-        std::atomic<uint64_t> maxSingleDimActorTimeUs{0};
+        std::atomic<uint64_t> totalNormalTickDispatches{0};
+        std::atomic<uint64_t> totalNormalTickTimeUs{0};
+        std::atomic<uint64_t> maxNormalTickTimeUs{0};
+        std::atomic<uint64_t> totalNormalTickWaitTimeUs{0};
+        std::atomic<uint64_t> maxNormalTickWaitTimeUs{0};
 
         std::atomic<uint64_t> totalMainThreadTasks{0};
         std::atomic<uint64_t> totalMainThreadSyncTasks{0};
         std::atomic<uint64_t> totalMainThreadAsyncTasks{0};
 
-        std::atomic<uint64_t> totalRecoveryAttempts{0};
         std::atomic<uint64_t> totalDangerousFunctions{0};
 
         std::atomic<uint64_t> totalLevelOriginTimeUs{0};
@@ -157,21 +141,16 @@ public:
         void reset() noexcept {
             totalLevelTicks.store(0, std::memory_order_relaxed);
 
-            totalActorDispatches.store(0, std::memory_order_relaxed);
-            totalActorBatches.store(0, std::memory_order_relaxed);
-            totalActorDispatchTimeUs.store(0, std::memory_order_relaxed);
-            maxActorDispatchTimeUs.store(0, std::memory_order_relaxed);
-            totalActorWaitTimeUs.store(0, std::memory_order_relaxed);
-            maxActorWaitTimeUs.store(0, std::memory_order_relaxed);
-            totalActorWorkTimeUs.store(0, std::memory_order_relaxed);
-            maxActorWorkTimeUs.store(0, std::memory_order_relaxed);
-            maxSingleDimActorTimeUs.store(0, std::memory_order_relaxed);
+            totalNormalTickDispatches.store(0, std::memory_order_relaxed);
+            totalNormalTickTimeUs.store(0, std::memory_order_relaxed);
+            maxNormalTickTimeUs.store(0, std::memory_order_relaxed);
+            totalNormalTickWaitTimeUs.store(0, std::memory_order_relaxed);
+            maxNormalTickWaitTimeUs.store(0, std::memory_order_relaxed);
 
             totalMainThreadTasks.store(0, std::memory_order_relaxed);
             totalMainThreadSyncTasks.store(0, std::memory_order_relaxed);
             totalMainThreadAsyncTasks.store(0, std::memory_order_relaxed);
 
-            totalRecoveryAttempts.store(0, std::memory_order_relaxed);
             totalDangerousFunctions.store(0, std::memory_order_relaxed);
 
             totalLevelOriginTimeUs.store(0, std::memory_order_relaxed);
@@ -190,24 +169,16 @@ public:
     void recordLevelTickStats(uint64_t levelOriginUs, uint64_t levelHookUs);
 
 private:
-    ParallelActorTickManager() = default;
-
-    struct CollectedPhaseBucket {
-        std::vector<ActorWorkItem>         items;
-        std::unordered_map<Actor*, size_t> index;
-    };
+    ParallelNormalTickManager() = default;
 
     struct WindowStats {
         uint64_t levelTicks = 0;
 
-        uint64_t actorDispatches = 0;
-        uint64_t actorBatches    = 0;
-        uint64_t totalActorDispatchTimeUs = 0;
-        uint64_t maxActorDispatchTimeUs   = 0;
-        uint64_t totalActorWaitTimeUs     = 0;
-        uint64_t maxActorWaitTimeUs       = 0;
-        uint64_t totalActorWorkTimeUs     = 0;
-        uint64_t maxActorWorkTimeUs       = 0;
+        uint64_t normalTickDispatches = 0;
+        uint64_t totalNormalTickTimeUs = 0;
+        uint64_t maxNormalTickTimeUs   = 0;
+        uint64_t totalNormalTickWaitUs = 0;
+        uint64_t maxNormalTickWaitUs   = 0;
 
         uint64_t totalLevelOriginTimeUs = 0;
         uint64_t maxLevelOriginTimeUs   = 0;
@@ -223,45 +194,23 @@ private:
         uint64_t maxMainThreadTaskProcessTimeUs   = 0;
     };
 
-    void     workerLoop(DimensionWorkerContext* ctx);
-    void     processActorPhaseOnWorker(DimensionWorkerContext& ctx);
-    size_t   processAllMainThreadTasks();
-    void     flushCurrentPhase();
-    void     clearCurrentPhaseBuckets();
-    void     collectActor(Actor& actor, bool isMob);
-    void     notifyDispatchProgress();
-    uint64_t getCurrentTick() const;
-    void     maybeLogWindowStats();
-
-    void recordActorPhaseStats(
-        uint64_t dispatchUs,
-        uint64_t waitUs,
-        uint64_t workUs,
-        uint64_t actorCount
-    );
-
-    static int phaseOrder(ActorTickPhase phase);
-    static const char* phaseName(ActorTickPhase phase);
+    DimensionWorkerContext* getOrCreateWorker(int dimensionId);
+    void                    workerLoop(DimensionWorkerContext* ctx);
+    size_t                  processAllMainThreadTasks();
+    void                    maybeLogWindowStats();
+    void                    recordNormalTickStats(uint64_t execUs, uint64_t waitUs);
 
     std::unordered_map<int, std::unique_ptr<DimensionWorkerContext>> mContexts;
     std::mutex                                                       mContextsMutex;
 
-    std::unordered_map<int, CollectedPhaseBucket>                    mCurrentPhaseBuckets;
-
     LevelTickSnapshot                                                mSnapshot;
     std::atomic<uint64_t>                                            mCurrentTick{0};
     std::atomic<bool>                                                mStopping{false};
-    std::atomic<uint32_t>                                            mActiveDispatches{0};
     bool                                                             mInitialized = false;
     bool                                                             mInLevelTick = false;
-    bool                                                             mBypassCurrentTick = false;
-    ActorTickPhase                                                   mCurrentPhase = ActorTickPhase::None;
 
     Stats                                                            mStats;
     WindowStats                                                      mWindowStats;
-
-    std::mutex              mDispatchMutex;
-    std::condition_variable mDispatchCV;
 
     static MainThreadTaskQueue mMainThreadTasks;
 
