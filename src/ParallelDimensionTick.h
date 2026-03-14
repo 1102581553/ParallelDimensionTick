@@ -23,11 +23,9 @@
 namespace dim_parallel {
 
 struct Config {
-    int  version                   = 2;
-    bool enabled                   = true;
-    bool debug                     = false;
-    bool parallelBlockEntities     = true;
-    bool blockEntityFallbackToMain = true;
+    int  version = 1;
+    bool enabled = true;
+    bool debug   = false;
 };
 
 Config&         getConfig();
@@ -55,7 +53,7 @@ private:
         std::shared_ptr<SyncState> sync;
     };
 
-    mutable std::mutex   mMutex;
+    mutable std::mutex    mMutex;
     std::vector<TaskItem> mTasks;
     std::vector<TaskItem> mProcessing;
 };
