@@ -4,8 +4,6 @@
 #include <ll/api/io/Logger.h>
 #include <ll/api/mod/NativeMod.h>
 
-#include <mc/network/Packet.h>
-#include <mc/world/level/BlockPos.h>
 #include <mc/world/level/dimension/Dimension.h>
 
 #include <atomic>
@@ -28,7 +26,7 @@ class Level;
 namespace dim_parallel {
 
 struct Config {
-    int  version                = 2;
+    int  version                = 3;
     bool enabled                = true;
     bool debug                  = false;
     bool parallelActorPhase     = true;
@@ -115,16 +113,16 @@ struct DimensionWorkerContext {
         DimensionPhase,
     };
 
-    Dimension*              dimension = nullptr;
+    Dimension*              dimension   = nullptr;
     int                     dimensionId = -1;
 
     std::vector<ActorWorkItem> actorTasks;
     JobType                    jobType = JobType::None;
 
-    uint64_t lastActorPhaseTimeUs     = 0;
-    uint64_t lastDimensionTickTimeUs  = 0;
-    uint64_t lastActorPhaseCallCount  = 0;
-    uint64_t lastActorCount           = 0;
+    uint64_t lastActorPhaseTimeUs    = 0;
+    uint64_t lastDimensionTickTimeUs = 0;
+    uint64_t lastActorPhaseCallCount = 0;
+    uint64_t lastActorCount          = 0;
 
     std::thread             workerThread;
     std::mutex              wakeMutex;
