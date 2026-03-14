@@ -49,7 +49,7 @@ public:
 
 private:
     struct TaskItem {
-        std::function<void()>    fn;
+        std::function<void()>     fn;
         std::shared_ptr<SyncState> sync;
     };
 
@@ -83,6 +83,8 @@ public:
     void shutdown();
     void dispatchAndSync(class Level* level, std::vector<Dimension*> dimensions);
 
+    bool isStopping() const;
+
     static bool                    isWorkerThread();
     static DimensionWorkerContext* getCurrentContext();
     static DimensionType           getCurrentDimensionType();
@@ -112,8 +114,12 @@ private:
     void   notifyDispatchProgress();
 
     std::unordered_map<int, std::unique_ptr<DimensionWorkerContext>> mContexts;
+    std::mutex                                                       mContextsMutex;
+
     LevelTickSnapshot                                                mSnapshot;
     std::atomic<bool>                                                mFallbackToSerial{false};
+    std::atomic<bool>                                                mStopping{false};
+    std::atomic<uint32_t>                                            mActiveDispatches{0};
     bool                                                             mInitialized = false;
     Stats                                                            mStats;
 
